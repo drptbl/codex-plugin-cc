@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
+  isUsageLimitError,
+  normalizeRateLimits,
   pickFallbackAccount,
   readAccountRegistry,
   switchActiveAccount
@@ -126,4 +128,53 @@ test("switchActiveAccount fails when the registry does not confirm the switch", 
   );
   assert.equal(result.switched, false);
   assert.match(result.detail, /verification/i);
+});
+
+const RATE_LIMITS_FIXTURE = JSON.parse(
+  fs.readFileSync(path.join(FIXTURES_DIR, "rate-limits-read.json"), "utf8")
+);
+
+test("isUsageLimitError matches known codex usage-limit codes", () => {
+  for (const code of [
+    "rate_limit_reached",
+    "usage_limit_reached",
+    "workspace_owner_usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+    "workspace_owner_credits_depleted"
+  ]) {
+    assert.equal(isUsageLimitError({ code, message: "x" }), true, code);
+    assert.equal(isUsageLimitError({ type: code, message: "x" }), true, `type:${code}`);
+  }
+});
+
+test("isUsageLimitError matches limit phrasing in the message text", () => {
+  assert.equal(isUsageLimitError({ message: "You've hit your usage limit." }), true);
+  assert.equal(isUsageLimitError({ message: "Rate limit reached for this account" }), true);
+});
+
+test("isUsageLimitError rejects unrelated errors", () => {
+  assert.equal(isUsageLimitError(null), false);
+  assert.equal(isUsageLimitError({ message: "stream disconnected" }), false);
+  assert.equal(isUsageLimitError({ code: "sandbox_denied", message: "denied" }), false);
+});
+
+test("normalizeRateLimits extracts used percents from the recorded fixture", () => {
+  const limits = normalizeRateLimits(RATE_LIMITS_FIXTURE);
+  // The fixture was captured live in Task 2; at least one window must yield a number
+  // unless the fixture recorded {"unsupported": true}.
+  if (!RATE_LIMITS_FIXTURE.unsupported) {
+    assert.equal(typeof limits.primaryUsedPercent, "number");
+  }
+  assert.equal(Object.hasOwn(limits, "secondaryUsedPercent"), true);
+});
+
+test("normalizeRateLimits returns nulls for unknown shapes", () => {
+  assert.deepEqual(normalizeRateLimits({ unexpected: true }), {
+    primaryUsedPercent: null,
+    secondaryUsedPercent: null
+  });
+  assert.deepEqual(normalizeRateLimits(null), {
+    primaryUsedPercent: null,
+    secondaryUsedPercent: null
+  });
 });

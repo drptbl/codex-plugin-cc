@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { binaryAvailable } from "./process.mjs";
+import { CodexAppServerClient } from "./app-server.mjs";
 
 const CODEX_AUTH_BINARY = "codex-auth";
 
@@ -107,4 +108,60 @@ export function switchActiveAccount(target, options = {}) {
   }
 
   return { switched: true, detail: `Switched active Codex account to ${target.email}.` };
+}
+
+const USAGE_LIMIT_CODES = new Set([
+  "rate_limit_reached",
+  "usage_limit_reached",
+  "workspace_owner_usage_limit_reached",
+  "workspace_member_usage_limit_reached",
+  "workspace_owner_credits_depleted"
+]);
+
+const USAGE_LIMIT_MESSAGE_PATTERN =
+  /(rate limit|usage limit|weekly limit)s? (reached|exceeded|hit)|hit your usage limit|out of (usage|credits)/i;
+
+export function isUsageLimitError(error) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const codes = [error.code, error.type, error.data?.type, error.data?.code]
+    .filter((value) => typeof value === "string");
+  if (codes.some((value) => USAGE_LIMIT_CODES.has(value))) {
+    return true;
+  }
+  return USAGE_LIMIT_MESSAGE_PATTERN.test(String(error.message ?? ""));
+}
+
+function windowUsedPercent(window) {
+  const used = window?.used_percent ?? window?.usedPercent ?? null;
+  if (typeof used === "number" && Number.isFinite(used)) {
+    return used;
+  }
+  const remaining = window?.remaining_percent ?? window?.remainingPercent ?? null;
+  if (typeof remaining === "number" && Number.isFinite(remaining)) {
+    return 100 - remaining;
+  }
+  return null;
+}
+
+export function normalizeRateLimits(response) {
+  const container = response?.rateLimits ?? response?.rate_limits ?? response ?? {};
+  return {
+    primaryUsedPercent: windowUsedPercent(container.primary),
+    secondaryUsedPercent: windowUsedPercent(container.secondary)
+  };
+}
+
+export async function readActiveRateLimits(cwd) {
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    const response = await client.request("account/rateLimits/read", {});
+    return normalizeRateLimits(response);
+  } catch {
+    return { primaryUsedPercent: null, secondaryUsedPercent: null };
+  } finally {
+    await client?.close().catch(() => {});
+  }
 }
