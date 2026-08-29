@@ -16,6 +16,13 @@
 - **The installed plugin cache copy** (`~/.claude/plugins/cache/openai-codex/codex/1.0.6`) is refcounted and swept — editing it in place is not durable. The fork lives at `/Users/jakubmucha/repos/codex-plugin-cc` and is installed via a local **directory marketplace** (same mechanism as the existing `synpress` marketplace at `/Users/jakubmucha/repos/synpress-qa`).
 - **Everything defaults off** (`autoAccountSwitch: false`); it is enabled per-repo via `/codex:setup --enable-auto-account-switch`, mirroring the existing `stopReviewGate` config pattern.
 
+## Amendment (2026-08-29, after Task 2)
+
+Task 2's live capture disproved two research assumptions, and Tasks 3/6/7 were rewritten accordingly. Governing facts:
+
+1. **The installed `codex-auth` 0.2.10 (npm `latest`) has no `--json` flag** — the JSON API exists only in `0.3.0-alpha.*` pre-releases, which we will not depend on for an auth-critical path. Account data is instead read **directly from `${CODEX_HOME:-~/.codex}/accounts/registry.json`** (real structure captured in `tests/fixtures/codex-auth-list.json`); an account is active iff its `account_key` equals the registry's top-level `active_account_key`. `codex-auth` is still used for switching: `codex-auth switch <email>` is non-interactive in 0.2.10, and success is verified by re-reading the registry, not by exit code alone.
+2. **The registry cache's `last_usage.primary.used_percent` has unreliable semantics** (observed values were the complement of live usage — it may store *remaining* percent — and `secondary` was `null` for both accounts). Therefore cached usage is used ONLY to order fallback candidates, NEVER to refuse a switch: `pickFallbackAccount(registry)` takes no threshold and returns null only when no non-active account exists. The threshold applies solely to the preflight check of the ACTIVE account, whose usage comes from the authoritative app-server response (`rateLimits.primary.usedPercent`, camelCase, `secondary` nullable — see `tests/fixtures/rate-limits-read.json`).
+
 ## Global Constraints
 
 - Node ≥ 18.18.0, plain ESM `.mjs`, two-space indent — match existing `plugins/codex/scripts/lib/*` style.
@@ -134,12 +141,12 @@ git commit -m "test: add redacted codex-auth and rate-limits fixtures"
 - Test: `tests/accounts.test.mjs`
 
 **Interfaces:**
-- Consumes: `binaryAvailable` from `plugins/codex/scripts/lib/process.mjs`; fixture `tests/fixtures/codex-auth-list.json`.
+- Consumes: `binaryAvailable` from `plugins/codex/scripts/lib/process.mjs`; fixture `tests/fixtures/codex-auth-list.json` (a redacted copy of a real `~/.codex/accounts/registry.json`).
 - Produces (used by Tasks 4/6/7):
-  - `readAccountRegistry({ runCommand? }) → { available: boolean, detail: string|null, activeAccountKey: string|null, accounts: Array<{ accountKey, email, alias, active, plan, primaryUsedPercent, secondaryUsedPercent, usageSource }> }`
-  - `pickFallbackAccount(registry, thresholdPercent) → account|null`
-  - `switchActiveAccount(accountKey, { runCommand? }) → { switched: boolean, detail: string }`
-  - `getCodexAuthAvailability() → { available: boolean, detail: string }`
+  - `readAccountRegistry({ registryPath? }) → { available: boolean, detail: string|null, activeAccountKey: string|null, accounts: Array<{ accountKey, email, alias, active, plan, primaryUsedPercent, secondaryUsedPercent }> }` — reads the registry FILE directly (default path `${CODEX_HOME:-~/.codex}/accounts/registry.json`); `active` is derived from `account_key === active_account_key`; usage comes from `last_usage.primary/secondary.used_percent` with `secondary` frequently `null`.
+  - `pickFallbackAccount(registry) → account|null` — least-cached-used non-active account; NO threshold parameter (see Amendment); null only when no non-active account exists.
+  - `switchActiveAccount(target, { runCommand?, registryPath? }) → { switched: boolean, detail: string }` where `target = { email, accountKey }` — runs `codex-auth switch <email>` and verifies success by re-reading the registry and checking `activeAccountKey === target.accountKey`.
+  - `getCodexAuthAvailability() → { available: boolean, detail: string }` — checks the `codex-auth` binary (needed for switching only; reading needs just the file).
   - internal default `runCodexAuth(args)` using `spawnSync`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -147,11 +154,13 @@ git commit -m "test: add redacted codex-auth and rate-limits fixtures"
 Create `tests/accounts.test.mjs`:
 ```js
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import { makeTempDir } from "./helpers.mjs";
 import {
   pickFallbackAccount,
   readAccountRegistry,
@@ -159,29 +168,25 @@ import {
 } from "../plugins/codex/scripts/lib/accounts.mjs";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
-const LIST_FIXTURE = fs.readFileSync(path.join(FIXTURES_DIR, "codex-auth-list.json"), "utf8");
+const REGISTRY_FIXTURE_PATH = path.join(FIXTURES_DIR, "codex-auth-list.json");
 
-function fakeRunner(result) {
-  const calls = [];
-  return {
-    calls,
-    run(args) {
-      calls.push(args);
-      return { status: 0, stdout: LIST_FIXTURE, stderr: "", ...result };
-    }
-  };
+function writeRegistry(mutate) {
+  const registry = JSON.parse(fs.readFileSync(REGISTRY_FIXTURE_PATH, "utf8"));
+  mutate?.(registry);
+  const registryPath = path.join(makeTempDir(), "registry.json");
+  fs.writeFileSync(registryPath, JSON.stringify(registry), "utf8");
+  return registryPath;
 }
 
-test("readAccountRegistry parses codex-auth list --json output", () => {
-  const runner = fakeRunner();
-  const registry = readAccountRegistry({ runCommand: runner.run });
+test("readAccountRegistry parses the on-disk registry and derives the active flag", () => {
+  const registry = readAccountRegistry({ registryPath: REGISTRY_FIXTURE_PATH });
 
   assert.equal(registry.available, true);
-  assert.deepEqual(runner.calls, [["list", "--json", "--skip-api"]]);
   assert.equal(registry.activeAccountKey, "acct-key-b");
   assert.equal(registry.accounts.length, 2);
 
   const active = registry.accounts.find((account) => account.active);
+  assert.equal(active.accountKey, "acct-key-b");
   assert.equal(active.email, "account-b@example.com");
   assert.equal(active.primaryUsedPercent, 99);
 
@@ -190,59 +195,92 @@ test("readAccountRegistry parses codex-auth list --json output", () => {
   assert.equal(idle.primaryUsedPercent, 6);
 });
 
-test("readAccountRegistry reports unavailable when codex-auth fails", () => {
+test("readAccountRegistry reports unavailable when the registry file is missing", () => {
   const registry = readAccountRegistry({
-    runCommand: () => ({ status: 1, stdout: "{\"error\":{\"message\":\"boom\"}}", stderr: "" })
+    registryPath: path.join(makeTempDir(), "missing", "registry.json")
   });
   assert.equal(registry.available, false);
   assert.equal(registry.accounts.length, 0);
 });
 
-test("readAccountRegistry reports unavailable on unparsable output", () => {
-  const registry = readAccountRegistry({
-    runCommand: () => ({ status: 0, stdout: "not json", stderr: "" })
-  });
+test("readAccountRegistry reports unavailable on unparsable registry content", () => {
+  const registryPath = path.join(makeTempDir(), "registry.json");
+  fs.writeFileSync(registryPath, "not json", "utf8");
+  const registry = readAccountRegistry({ registryPath });
   assert.equal(registry.available, false);
 });
 
-test("pickFallbackAccount returns the least-used inactive account under threshold", () => {
-  const registry = readAccountRegistry({ runCommand: fakeRunner().run });
-  const fallback = pickFallbackAccount(registry, 95);
+test("pickFallbackAccount returns the least-cached-used inactive account", () => {
+  const registry = readAccountRegistry({ registryPath: REGISTRY_FIXTURE_PATH });
+  const fallback = pickFallbackAccount(registry);
   assert.equal(fallback.accountKey, "acct-key-a");
 });
 
-test("pickFallbackAccount returns null when every inactive account is over threshold", () => {
-  const registry = readAccountRegistry({ runCommand: fakeRunner().run });
-  const fallback = pickFallbackAccount(registry, 5);
+test("pickFallbackAccount returns null when no inactive account exists", () => {
+  const registryPath = writeRegistry((registry) => {
+    registry.accounts = registry.accounts.filter(
+      (account) => account.account_key === "acct-key-b"
+    );
+  });
+  const fallback = pickFallbackAccount(readAccountRegistry({ registryPath }));
   assert.equal(fallback, null);
 });
 
-test("pickFallbackAccount treats unknown usage as usable", () => {
-  const registry = {
-    available: true,
-    activeAccountKey: "acct-key-b",
-    accounts: [
-      { accountKey: "acct-key-b", active: true, primaryUsedPercent: 99, secondaryUsedPercent: 99 },
-      { accountKey: "acct-key-a", active: false, primaryUsedPercent: null, secondaryUsedPercent: null }
-    ]
-  };
-  const fallback = pickFallbackAccount(registry, 95);
+test("pickFallbackAccount tolerates accounts with no cached usage", () => {
+  const registryPath = writeRegistry((registry) => {
+    for (const account of registry.accounts) {
+      if (account.account_key === "acct-key-a") {
+        account.last_usage = null;
+      }
+    }
+  });
+  const fallback = pickFallbackAccount(readAccountRegistry({ registryPath }));
   assert.equal(fallback.accountKey, "acct-key-a");
 });
 
-test("switchActiveAccount invokes codex-auth switch with the account key", () => {
-  const runner = fakeRunner({ stdout: "{\"schema_version\":1,\"command\":\"switch\",\"switched_to\":{}}" });
-  const result = switchActiveAccount("acct-key-a", { runCommand: runner.run });
+test("switchActiveAccount runs codex-auth switch by email and verifies via the registry", () => {
+  // Simulate the post-switch world: registry already shows acct-key-a active.
+  const registryPath = writeRegistry((registry) => {
+    registry.active_account_key = "acct-key-a";
+  });
+  const calls = [];
+  const result = switchActiveAccount(
+    { email: "account-a@example.com", accountKey: "acct-key-a" },
+    {
+      registryPath,
+      runCommand: (args) => {
+        calls.push(args);
+        return { status: 0, stdout: "", stderr: "" };
+      }
+    }
+  );
   assert.equal(result.switched, true);
-  assert.deepEqual(runner.calls, [["switch", "acct-key-a", "--json", "--skip-api"]]);
+  assert.deepEqual(calls, [["switch", "account-a@example.com"]]);
 });
 
 test("switchActiveAccount reports failure on non-zero exit", () => {
-  const result = switchActiveAccount("acct-key-a", {
-    runCommand: () => ({ status: 1, stdout: "{\"error\":{\"message\":\"ambiguous\"}}", stderr: "" })
-  });
+  const result = switchActiveAccount(
+    { email: "account-a@example.com", accountKey: "acct-key-a" },
+    {
+      registryPath: REGISTRY_FIXTURE_PATH,
+      runCommand: () => ({ status: 1, stdout: "", stderr: "no matching account" })
+    }
+  );
   assert.equal(result.switched, false);
-  assert.match(result.detail, /ambiguous/);
+  assert.match(result.detail, /no matching account/);
+});
+
+test("switchActiveAccount fails when the registry does not confirm the switch", () => {
+  // Registry still shows acct-key-b active even though the command exited 0.
+  const result = switchActiveAccount(
+    { email: "account-a@example.com", accountKey: "acct-key-a" },
+    {
+      registryPath: REGISTRY_FIXTURE_PATH,
+      runCommand: () => ({ status: 0, stdout: "", stderr: "" })
+    }
+  );
+  assert.equal(result.switched, false);
+  assert.match(result.detail, /verification/i);
 });
 ```
 
@@ -255,6 +293,9 @@ Expected: FAIL — `Cannot find module .../accounts.mjs`.
 
 Create `plugins/codex/scripts/lib/accounts.mjs`:
 ```js
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { binaryAvailable } from "./process.mjs";
@@ -263,6 +304,11 @@ const CODEX_AUTH_BINARY = "codex-auth";
 
 export function getCodexAuthAvailability() {
   return binaryAvailable(CODEX_AUTH_BINARY, ["--version"]);
+}
+
+function resolveRegistryPath() {
+  const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  return path.join(codexHome, "accounts", "registry.json");
 }
 
 function runCodexAuth(args) {
@@ -274,50 +320,52 @@ function runCodexAuth(args) {
   };
 }
 
-function parseJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
 function usedPercent(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function normalizeAccount(raw) {
-  const usage = raw.usage ?? raw.last_usage ?? null;
+function normalizeAccount(raw, activeAccountKey) {
+  const usage = raw.last_usage ?? null;
   return {
     accountKey: raw.account_key ?? null,
     email: raw.email ?? null,
     alias: raw.alias ?? null,
-    active: Boolean(raw.active),
+    active: raw.account_key != null && raw.account_key === activeAccountKey,
     plan: raw.plan ?? null,
     primaryUsedPercent: usedPercent(usage?.primary?.used_percent),
-    secondaryUsedPercent: usedPercent(usage?.secondary?.used_percent),
-    usageSource: usage?.source ?? "none"
+    secondaryUsedPercent: usedPercent(usage?.secondary?.used_percent)
   };
 }
 
 export function readAccountRegistry(options = {}) {
-  const runCommand = options.runCommand ?? runCodexAuth;
-  const result = runCommand(["list", "--json", "--skip-api"]);
-  const parsed = parseJson(result.stdout);
-
-  if (result.status !== 0 || !parsed || !Array.isArray(parsed.accounts)) {
-    const detail =
-      parsed?.error?.message ??
-      result.stderr.trim() ??
-      "codex-auth list produced unusable output";
-    return { available: false, detail, activeAccountKey: null, accounts: [] };
+  const registryPath = options.registryPath ?? resolveRegistryPath();
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  } catch (error) {
+    return {
+      available: false,
+      detail: `Cannot read codex-auth registry at ${registryPath}: ${error.message}`,
+      activeAccountKey: null,
+      accounts: []
+    };
   }
 
+  if (!Array.isArray(parsed.accounts)) {
+    return {
+      available: false,
+      detail: `codex-auth registry at ${registryPath} has no accounts array`,
+      activeAccountKey: null,
+      accounts: []
+    };
+  }
+
+  const activeAccountKey = parsed.active_account_key ?? null;
   return {
     available: true,
     detail: null,
-    activeAccountKey: parsed.active_account_key ?? null,
-    accounts: parsed.accounts.map(normalizeAccount)
+    activeAccountKey,
+    accounts: parsed.accounts.map((raw) => normalizeAccount(raw, activeAccountKey))
   };
 }
 
@@ -325,35 +373,42 @@ function worstUsedPercent(account) {
   return Math.max(account.primaryUsedPercent ?? 0, account.secondaryUsedPercent ?? 0);
 }
 
-export function pickFallbackAccount(registry, thresholdPercent) {
+export function pickFallbackAccount(registry) {
+  // Cached registry usage has unreliable semantics (observed storing what
+  // looks like REMAINING percent in some versions), so it only orders the
+  // candidates; it never disqualifies one. The single failover attempt is
+  // the real guard against switching to an exhausted account.
   const candidates = registry.accounts
-    .filter((account) => !account.active && account.accountKey)
-    .filter((account) => worstUsedPercent(account) < thresholdPercent)
+    .filter((account) => !account.active && account.accountKey && account.email)
     .sort((left, right) => worstUsedPercent(left) - worstUsedPercent(right));
   return candidates[0] ?? null;
 }
 
-export function switchActiveAccount(accountKey, options = {}) {
+export function switchActiveAccount(target, options = {}) {
   const runCommand = options.runCommand ?? runCodexAuth;
-  const result = runCommand(["switch", accountKey, "--json", "--skip-api"]);
-  const parsed = parseJson(result.stdout);
+  const result = runCommand(["switch", target.email]);
 
-  if (result.status !== 0 || parsed?.error) {
+  if (result.status !== 0) {
+    const detail = (result.stderr.trim() || result.stdout.trim()) || "codex-auth switch failed";
+    return { switched: false, detail };
+  }
+
+  const registry = readAccountRegistry(options);
+  if (!registry.available || registry.activeAccountKey !== target.accountKey) {
     return {
       switched: false,
-      detail: parsed?.error?.message ?? result.stderr.trim() ?? "codex-auth switch failed"
+      detail: `codex-auth switch ran but registry verification failed: ${target.email} is not the active account.`
     };
   }
 
-  return { switched: true, detail: `Switched active Codex account to ${accountKey}.` };
+  return { switched: true, detail: `Switched active Codex account to ${target.email}.` };
 }
 ```
-**If Task 2's fixture spelled the usage snapshot differently** (e.g. a different top-level key than `usage`/`last_usage`), adjust `normalizeAccount` to the fixture — the fixture is the source of truth, the tests must pass against it unmodified.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `$TEST_ENV node --test tests/accounts.test.mjs`
-Expected: PASS (8 tests). Then run the full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 99 pass, 0 fail.
+Expected: PASS (9 tests). Then run the full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 100 pass, 0 fail.
 
 - [ ] **Step 5: Commit**
 
@@ -506,7 +561,7 @@ export async function readActiveRateLimits(cwd) {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `$TEST_ENV node --test tests/accounts.test.mjs` — expect PASS (13 tests). Full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 104 pass, 0 fail.
+Run: `$TEST_ENV node --test tests/accounts.test.mjs` — expect PASS (14 tests). Full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 105 pass, 0 fail.
 
 - [ ] **Step 5: Commit**
 
@@ -653,7 +708,7 @@ Note `sessionDir: null` in the teardown call: `teardownBrokerSession` deletes th
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `$TEST_ENV node --test tests/broker-restart.test.mjs` — expect PASS (2 tests). Full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 106 pass, 0 fail.
+Run: `$TEST_ENV node --test tests/broker-restart.test.mjs` — expect PASS (2 tests). Full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 107 pass, 0 fail.
 
 - [ ] **Step 5: Commit**
 
@@ -815,12 +870,12 @@ import { getCodexAuthAvailability, readAccountRegistry } from "./lib/accounts.mj
 4. In `buildSetupReport` (line 182), after `const config = getConfig(workspaceRoot);` add:
 ```js
   const codexAuthStatus = getCodexAuthAvailability();
-  const registry = codexAuthStatus.available ? readAccountRegistry() : null;
+  const registry = readAccountRegistry();
   const accountSwitching = {
     enabled: Boolean(config.autoAccountSwitch),
     thresholdPercent: config.autoAccountSwitchThresholdPercent,
     codexAuth: codexAuthStatus,
-    accounts: registry?.available
+    accounts: registry.available
       ? registry.accounts.map((account) => ({
           email: account.email,
           alias: account.alias,
@@ -831,10 +886,13 @@ import { getCodexAuthAvailability, readAccountRegistry } from "./lib/accounts.mj
       : []
   };
 ```
-and add `accountSwitching,` to the returned object (next to `reviewGateEnabled`). Also add a next step when the feature is enabled but codex-auth is missing:
+and add `accountSwitching,` to the returned object (next to `reviewGateEnabled`). Also add next steps when the feature is enabled but its prerequisites are missing:
 ```js
   if (config.autoAccountSwitch && !codexAuthStatus.available) {
     nextSteps.push("Install codex-auth with `npm install -g @loongphy/codex-auth` (auto account switch is enabled but the binary is missing).");
+  }
+  if (config.autoAccountSwitch && codexAuthStatus.available && !registry.available) {
+    nextSteps.push("Register accounts with `codex-auth login` or `codex-auth import` (auto account switch is enabled but no account registry was found).");
   }
 ```
 
@@ -848,7 +906,7 @@ Add to the command doc's flag list (match the file's existing formatting):
 
 - [ ] **Step 8: Full suite + manual smoke, then commit**
 
-Run: `$TEST_ENV node --test tests/*.test.mjs` — expect 108 pass, 0 fail.
+Run: `$TEST_ENV node --test tests/*.test.mjs` — expect 109 pass, 0 fail.
 Smoke:
 ```bash
 node plugins/codex/scripts/codex-companion.mjs setup --json --cwd /tmp | head -40
@@ -883,7 +941,7 @@ import {
 } from "../plugins/codex/scripts/lib/accounts.mjs";
 
 function orchestrationDeps(overrides = {}) {
-  const registry = readAccountRegistry({ runCommand: fakeRunner().run });
+  const registry = readAccountRegistry({ registryPath: REGISTRY_FIXTURE_PATH });
   const calls = { switched: [], restarted: 0 };
   return {
     calls,
@@ -891,9 +949,9 @@ function orchestrationDeps(overrides = {}) {
       getConfig: () => ({ autoAccountSwitch: true, autoAccountSwitchThresholdPercent: 95 }),
       readAccountRegistry: () => registry,
       readActiveRateLimits: async () => ({ primaryUsedPercent: 99, secondaryUsedPercent: 99 }),
-      switchActiveAccount: (key) => {
-        calls.switched.push(key);
-        return { switched: true, detail: `switched to ${key}` };
+      switchActiveAccount: (target) => {
+        calls.switched.push(target.accountKey);
+        return { switched: true, detail: `switched to ${target.email}` };
       },
       restartRuntime: async () => {
         calls.restarted += 1;
@@ -952,14 +1010,19 @@ test("switchToFallbackAccount switches without a threshold check", async () => {
   assert.equal(calls.restarted, 1);
 });
 
-test("switchToFallbackAccount refuses when no fallback account is usable", async () => {
+test("switchToFallbackAccount refuses when no other account exists", async () => {
   const { deps, calls } = orchestrationDeps();
   deps.readAccountRegistry = () => ({
     available: true,
     activeAccountKey: "acct-key-b",
     accounts: [
-      { accountKey: "acct-key-b", active: true, primaryUsedPercent: 99, secondaryUsedPercent: 99 },
-      { accountKey: "acct-key-a", active: false, primaryUsedPercent: 99, secondaryUsedPercent: 99 }
+      {
+        accountKey: "acct-key-b",
+        email: "account-b@example.com",
+        active: true,
+        primaryUsedPercent: 99,
+        secondaryUsedPercent: 99
+      }
     ]
   });
   const result = await switchToFallbackAccount("/tmp/workspace", { deps });
@@ -1009,10 +1072,10 @@ function orchestrationDeps(overrides = {}) {
 async function performSwitch(cwd, deps, fallback, onProgress) {
   notify(
     onProgress,
-    `Codex account limit handling: switching to ${fallback.email ?? fallback.accountKey} and restarting the Codex runtime.`
+    `Codex account limit handling: switching to ${fallback.email} and restarting the Codex runtime.`
   );
   await deps.restartRuntime(cwd);
-  const switchResult = deps.switchActiveAccount(fallback.accountKey);
+  const switchResult = deps.switchActiveAccount(fallback);
   if (!switchResult.switched) {
     notify(onProgress, `Codex account switch failed: ${switchResult.detail}`);
     return { switched: false, reason: "switch-failed" };
@@ -1044,7 +1107,7 @@ export async function maybeAutoSwitchAccount(cwd, options = {}) {
     return { switched: false, reason: "under-threshold" };
   }
 
-  const fallback = pickFallbackAccount(registry, threshold);
+  const fallback = pickFallbackAccount(registry);
   if (!fallback) {
     return { switched: false, reason: "no-fallback" };
   }
@@ -1064,19 +1127,19 @@ export async function switchToFallbackAccount(cwd, options = {}) {
     return { switched: false, reason: "codex-auth-unavailable" };
   }
 
-  const fallback = pickFallbackAccount(registry, config.autoAccountSwitchThresholdPercent);
+  const fallback = pickFallbackAccount(registry);
   if (!fallback) {
     return { switched: false, reason: "no-fallback" };
   }
 
-  return performSwitch(cwd, deps, registry, fallback, options.onProgress);
+  return performSwitch(cwd, deps, fallback, options.onProgress);
 }
 ```
 Note the runtime restart happens **before** the credential switch, so no live app-server keeps serving with stale tokens; the respawned broker (or the next direct spawn) reads the new `auth.json`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `$TEST_ENV node --test tests/accounts.test.mjs` — expect PASS (19 tests). Full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 114 pass, 0 fail.
+Run: `$TEST_ENV node --test tests/accounts.test.mjs` — expect PASS (20 tests). Full suite: `$TEST_ENV node --test tests/*.test.mjs` — expect 115 pass, 0 fail.
 
 - [ ] **Step 5: Commit**
 
@@ -1168,7 +1231,7 @@ The task retry resumes the same thread (`resumeThreadId: result.threadId`): thre
 - [ ] **Step 4: Run the full suite**
 
 Run: `$TEST_ENV node --test tests/*.test.mjs`
-Expected: 114 pass, 0 fail (`runtime.test.mjs` exercises these entry points via the fake codex fixture; if any test stubs `runAppServerTurn` internals, adjust for the rename — behavior with `autoAccountSwitch: false` must be bit-identical to before).
+Expected: 115 pass, 0 fail (`runtime.test.mjs` exercises these entry points via the fake codex fixture; if any test stubs `runAppServerTurn` internals, adjust for the rename — behavior with `autoAccountSwitch: false` must be bit-identical to before).
 
 - [ ] **Step 5: Manual smoke with the feature disabled (default)**
 
@@ -1210,7 +1273,7 @@ Expected: exit 0. If it reports other files carrying the version (e.g. `package.
 
 - [ ] **Step 4: Full suite and commit**
 
-Run: `$TEST_ENV node --test tests/*.test.mjs` — expect 114 pass, 0 fail.
+Run: `$TEST_ENV node --test tests/*.test.mjs` — expect 115 pass, 0 fail.
 ```bash
 git add .claude-plugin/marketplace.json plugins/codex/.claude-plugin/plugin.json plugins/codex/CHANGELOG.md README.md package.json
 git commit -m "chore: rebrand fork as codex-fork 1.1.0 with auto account switching"
@@ -1270,7 +1333,7 @@ git remote add upstream https://github.com/openai/codex-plugin-cc   # already or
 ## Risks and open points
 
 - **`account/rateLimits/read` response shape** is confirmed only by the Task 2 fixture; Tasks 4/7 explicitly defer to the fixture. If the method is unsupported, preflight degrades to registry-cached usage (may be stale) and the reactive failover path still works.
-- **codex-auth registry freshness:** with `--skip-api`, the fallback account's usage is whatever codex-auth last cached. Worst case we switch to an also-exhausted account; the single-attempt retry then fails with a clear usage-limit error rather than looping. Refreshing via `codex-auth list --api` is deliberately avoided (account-restriction warning).
+- **codex-auth registry freshness/semantics:** the fallback account's cached `used_percent` is stale and possibly inverted (see Amendment), so it only orders candidates. Worst case we switch to an also-exhausted account; the single-attempt retry then fails with a clear usage-limit error rather than looping. Refreshing via codex-auth's live API mode is deliberately avoided (account-restriction warning).
 - **Windows:** the socket-unlink step in `restartBrokerSession` is POSIX-only by guard; this machine is macOS, Windows support keeps upstream behavior (restart returns null → direct transport).
 - **Upstream drift:** the fork tracks `openai/codex-plugin-cc` (`origin`). Rebase `feature/auto-account-switch` onto upstream tags when new versions ship; the touched surface (2 entry points, 1 new lib, config defaults, render) is intentionally small.
 - **In-flight broker jobs:** `restartBrokerSession` kills the broker; the preflight runs before a thread starts and the failover runs after a turn already failed, so no successful in-flight work is lost. Other concurrent Claude sessions sharing the same broker would see one interrupted turn — acceptable for a two-account single-user setup.
