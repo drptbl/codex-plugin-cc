@@ -1,0 +1,75 @@
+{
+  "schema_version": 3,
+  "active_account_key": "acct-key-b",
+  "active_account_activated_at_ms": 1787975693283,
+  "auto_switch": {
+    "enabled": false,
+    "threshold_5h_percent": 10,
+    "threshold_weekly_percent": 5
+  },
+  "api": {
+    "usage": true,
+    "account": true
+  },
+  "accounts": [
+    {
+      "account_key": "acct-key-a",
+      "chatgpt_account_id": "acct-id-a",
+      "chatgpt_user_id": "user-id-a",
+      "email": "account-a@example.com",
+      "alias": null,
+      "account_name": null,
+      "plan": "pro",
+      "auth_mode": "chatgpt",
+      "created_at": 1787975683,
+      "last_used_at": 1787975683,
+      "last_usage": {
+        "primary": {
+          "used_percent": 6,
+          "window_minutes": 10080,
+          "resets_at": 1788466820
+        },
+        "secondary": null,
+        "credits": {
+          "has_credits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "plan_type": "pro"
+      },
+      "last_usage_at": 1787977804,
+      "last_local_rollout": null
+    },
+    {
+      "account_key": "acct-key-b",
+      "chatgpt_account_id": "acct-id-b",
+      "chatgpt_user_id": "user-id-b",
+      "email": "account-b@example.com",
+      "alias": null,
+      "account_name": null,
+      "plan": "pro",
+      "auth_mode": "chatgpt",
+      "created_at": 1787975693,
+      "last_used_at": 1787975693,
+      "last_usage": {
+        "primary": {
+          "used_percent": 99,
+          "window_minutes": 10080,
+          "resets_at": 1788578406
+        },
+        "secondary": null,
+        "credits": {
+          "has_credits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "plan_type": "pro"
+      },
+      "last_usage_at": 1787977967,
+      "last_local_rollout": {
+        "path": "/redacted/path/to/rollout.jsonl",
+        "event_timestamp_ms": 1787977949389
+      }
+    }
+  ]
+}
