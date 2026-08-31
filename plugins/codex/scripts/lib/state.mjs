@@ -20,7 +20,9 @@ function defaultState() {
   return {
     version: STATE_VERSION,
     config: {
-      stopReviewGate: false
+      stopReviewGate: false,
+      autoAccountSwitch: false,
+      autoAccountSwitchThresholdPercent: 95
     },
     jobs: []
   };

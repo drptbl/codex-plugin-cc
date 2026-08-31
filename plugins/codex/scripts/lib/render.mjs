@@ -186,9 +186,27 @@ export function renderSetupReport(report) {
     `- codex: ${report.codex.detail}`,
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
-    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
-    ""
+    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`
   ];
+
+  if (report.accountSwitching) {
+    const section = report.accountSwitching;
+    const summary = section.enabled
+      ? `enabled (threshold ${section.thresholdPercent}%)`
+      : "disabled";
+    lines.push(`- auto account switch: ${summary}`);
+    if (!section.codexAuth.available) {
+      lines.push(`  codex-auth unavailable: ${section.codexAuth.detail}`);
+    }
+    for (const account of section.accounts) {
+      const marker = account.active ? "*" : " ";
+      const name = account.alias ?? account.email ?? "unknown account";
+      const primary = account.primaryUsedPercent ?? "?";
+      const secondary = account.secondaryUsedPercent ?? "?";
+      lines.push(`  ${marker} ${name} — 5h ${primary}%, weekly ${secondary}%`);
+    }
+  }
+  lines.push("");
 
   if (report.actionsTaken.length > 0) {
     lines.push("Actions taken:");

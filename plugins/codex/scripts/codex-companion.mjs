@@ -34,6 +34,7 @@ import {
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
+import { getCodexAuthAvailability, readAccountRegistry } from "./lib/accounts.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
@@ -186,6 +187,22 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   const codexStatus = getCodexAvailability(cwd);
   const authStatus = await getCodexAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
+  const codexAuthStatus = getCodexAuthAvailability();
+  const registry = readAccountRegistry();
+  const accountSwitching = {
+    enabled: Boolean(config.autoAccountSwitch),
+    thresholdPercent: config.autoAccountSwitchThresholdPercent,
+    codexAuth: codexAuthStatus,
+    accounts: registry.available
+      ? registry.accounts.map((account) => ({
+          email: account.email,
+          alias: account.alias,
+          active: account.active,
+          primaryUsedPercent: account.primaryUsedPercent,
+          secondaryUsedPercent: account.secondaryUsedPercent
+        }))
+      : []
+  };
 
   const nextSteps = [];
   if (!codexStatus.available) {
@@ -198,6 +215,12 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
   }
+  if (config.autoAccountSwitch && !codexAuthStatus.available) {
+    nextSteps.push("Install codex-auth with `npm install -g @loongphy/codex-auth` (auto account switch is enabled but the binary is missing).");
+  }
+  if (config.autoAccountSwitch && codexAuthStatus.available && !registry.available) {
+    nextSteps.push("Register accounts with `codex-auth login` or `codex-auth import` (auto account switch is enabled but no account registry was found).");
+  }
 
   return {
     ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
@@ -207,6 +230,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    accountSwitching,
     actionsTaken,
     nextSteps
   };
@@ -214,12 +238,21 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
+    valueOptions: ["cwd", "auto-switch-threshold"],
+    booleanOptions: [
+      "json",
+      "enable-review-gate",
+      "disable-review-gate",
+      "enable-auto-account-switch",
+      "disable-auto-account-switch"
+    ]
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  if (options["enable-auto-account-switch"] && options["disable-auto-account-switch"]) {
+    throw new Error("Choose either --enable-auto-account-switch or --disable-auto-account-switch.");
   }
 
   const cwd = resolveCommandCwd(options);
@@ -232,6 +265,22 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
+  if (options["enable-auto-account-switch"]) {
+    setConfig(workspaceRoot, "autoAccountSwitch", true);
+    actionsTaken.push(`Enabled automatic Codex account switching for ${workspaceRoot}.`);
+  } else if (options["disable-auto-account-switch"]) {
+    setConfig(workspaceRoot, "autoAccountSwitch", false);
+    actionsTaken.push(`Disabled automatic Codex account switching for ${workspaceRoot}.`);
+  }
+  if (options["auto-switch-threshold"] !== undefined) {
+    const threshold = Number(options["auto-switch-threshold"]);
+    if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 100) {
+      throw new Error("--auto-switch-threshold expects a percentage between 1 and 100.");
+    }
+    setConfig(workspaceRoot, "autoAccountSwitchThresholdPercent", threshold);
+    actionsTaken.push(`Set the account switch threshold to ${threshold}% for ${workspaceRoot}.`);
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);

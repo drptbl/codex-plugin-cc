@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderReviewResult, renderSetupReport, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -56,4 +56,31 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.doesNotMatch(output, /^\{/);
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
+});
+
+test("renderSetupReport prints the account switching section when present", () => {
+  const output = renderSetupReport({
+    ready: true,
+    node: { detail: "v24" },
+    npm: { detail: "12" },
+    codex: { detail: "codex-cli 0.150.1" },
+    auth: { detail: "ChatGPT login active for account-b@example.com" },
+    sessionRuntime: { label: "shared session" },
+    reviewGateEnabled: false,
+    accountSwitching: {
+      enabled: true,
+      thresholdPercent: 95,
+      codexAuth: { available: true, detail: "codex-auth 0.2.10" },
+      accounts: [
+        { email: "account-b@example.com", alias: null, active: true, primaryUsedPercent: 99, secondaryUsedPercent: 99 },
+        { email: "account-a@example.com", alias: null, active: false, primaryUsedPercent: 6, secondaryUsedPercent: 6 }
+      ]
+    },
+    actionsTaken: [],
+    nextSteps: []
+  });
+
+  assert.match(output, /auto account switch: enabled \(threshold 95%\)/);
+  assert.match(output, /\* account-b@example\.com — 5h 99%, weekly 99%/);
+  assert.match(output, /  account-a@example\.com — 5h 6%, weekly 6%/);
 });
