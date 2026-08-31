@@ -41,6 +41,7 @@ import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { isUsageLimitError, maybeAutoSwitchAccount, switchToFallbackAccount } from "./accounts.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
@@ -999,12 +1000,7 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   }
 }
 
-export async function runAppServerReview(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
-
+async function runAppServerReviewAttempt(cwd, options = {}) {
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
@@ -1055,6 +1051,25 @@ export async function runAppServerReview(cwd, options = {}) {
   });
 }
 
+export async function runAppServerReview(cwd, options = {}) {
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+  }
+
+  await maybeAutoSwitchAccount(cwd, { onProgress: options.onProgress });
+
+  let result = await runAppServerReviewAttempt(cwd, options);
+  if (result.error && isUsageLimitError(result.error)) {
+    const failover = await switchToFallbackAccount(cwd, { onProgress: options.onProgress });
+    if (failover.switched) {
+      result = await runAppServerReviewAttempt(cwd, options);
+      result.accountSwitched = failover.toAccount ?? null;
+    }
+  }
+  return result;
+}
+
 export async function importExternalAgentSession(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1092,12 +1107,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
   });
 }
 
-export async function runAppServerTurn(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
-
+async function runAppServerTurnAttempt(cwd, options = {}) {
   return withAppServer(cwd, async (client) => {
     let threadId;
 
@@ -1157,6 +1167,28 @@ export async function runAppServerTurn(cwd, options = {}) {
       commandExecutions: turnState.commandExecutions
     };
   });
+}
+
+export async function runAppServerTurn(cwd, options = {}) {
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+  }
+
+  await maybeAutoSwitchAccount(cwd, { onProgress: options.onProgress });
+
+  let result = await runAppServerTurnAttempt(cwd, options);
+  if (result.error && isUsageLimitError(result.error)) {
+    const failover = await switchToFallbackAccount(cwd, { onProgress: options.onProgress });
+    if (failover.switched) {
+      const retryOptions = result.threadId
+        ? { ...options, resumeThreadId: result.threadId }
+        : options;
+      result = await runAppServerTurnAttempt(cwd, retryOptions);
+      result.accountSwitched = failover.toAccount ?? null;
+    }
+  }
+  return result;
 }
 
 export async function findLatestTaskThread(cwd) {
