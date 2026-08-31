@@ -26,6 +26,25 @@ they already have.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
+## Enforcement policy (this fork)
+
+**Codex is review-only, structurally, in every repository.** This is the
+fork's contract, not a per-repo note:
+
+- Every app-server this plugin launches runs with `-c sandbox_mode=read-only`,
+  which outranks any `~/.codex/config.toml` sandbox setting (a user-level
+  `danger-full-access` silently defeated the 1.1.0 per-thread force — measured
+  live, 2026-08-31). Interactive `codex` outside the plugin is untouched.
+- The stop-gate prompt states the reviewer role: findings in the BLOCK reason,
+  never edits. The test suite's fake codex REFUSES to start an app-server
+  without the read-only override, so the contract cannot regress silently.
+- The stop-time review gate defaults OFF per repository
+  (`/codex:setup --enable-review-gate` opts in; setup output names the scope).
+  When enabled it announces every start/finish/skip on stderr, skips when the
+  repository fingerprint is unchanged since the last review, and rate-limits
+  to one review per 10 minutes.
+
+
 ## What You Get
 
 - `/codex:review` for a normal read-only Codex review

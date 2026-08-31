@@ -247,7 +247,21 @@ function taskPayload(prompt, resume) {
   return "Handled the requested task.\\nTask prompt accepted.";
 }
 
-const args = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+// 1.2.0 (review-only enforcement): the plugin launches every app-server with
+// leading `-c key=value` config overrides — REQUIRE the read-only override so
+// the suite pins the enforcement contract, then strip the pairs for dispatch.
+const configOverrides = [];
+let argStart = 0;
+while (rawArgs[argStart] === "-c" && argStart + 1 < rawArgs.length) {
+  configOverrides.push(rawArgs[argStart + 1]);
+  argStart += 2;
+}
+const args = rawArgs.slice(argStart);
+if (args[0] === "app-server" && !configOverrides.includes("sandbox_mode=read-only")) {
+  console.error("fake codex: app-server launched WITHOUT the read-only sandbox override — the 1.2.0 enforcement contract is broken");
+  process.exit(1);
+}
 if (args[0] === "--version") {
   console.log("codex-cli test");
   process.exit(0);

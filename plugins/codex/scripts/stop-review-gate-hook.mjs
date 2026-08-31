@@ -8,12 +8,18 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
+import crypto from "node:crypto";
+
+import { getConfig, listJobs, updateState } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Economics (2026-08-31): a review every turn-end re-reviewed stale turns and
+// duplicated landed work. Skip when the repository fingerprint is unchanged
+// since the last stop review, and rate-limit consecutive reviews.
+const STOP_REVIEW_COOLDOWN_MS = 10 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -95,6 +101,35 @@ function parseStopReviewOutput(rawOutput) {
   };
 }
 
+/// HEAD sha + a hash of the porcelain status — "did anything change since the
+/// last stop review". null outside a git repo (always review there).
+function computeRepoFingerprint(cwd) {
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  if (head.status !== 0) {
+    return null;
+  }
+  const porcelain = spawnSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
+  const dirty = porcelain.status === 0 ? porcelain.stdout : "";
+  return crypto
+    .createHash("sha1")
+    .update(head.stdout.trim())
+    .update("|")
+    .update(dirty)
+    .digest("hex");
+}
+
+function recordStopReview(workspaceRoot, fingerprint, at) {
+  try {
+    updateState(workspaceRoot, (state) => {
+      state.config = state.config ?? {};
+      state.config.stopReviewLastFingerprint = fingerprint;
+      state.config.stopReviewLastAt = at;
+    });
+  } catch {
+    // best-effort bookkeeping — a failed stamp must never break the gate
+  }
+}
+
 function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
@@ -163,7 +198,29 @@ function main() {
     return;
   }
 
+  // Economics: skip when nothing changed since the last stop review, and
+  // rate-limit consecutive reviews. Visibility: every skip and every run says
+  // so on stderr — background review work must never be a mystery again.
+  const fingerprint = computeRepoFingerprint(cwd);
+  const lastFingerprint = config.stopReviewLastFingerprint ?? null;
+  const lastAt = Number(config.stopReviewLastAt ?? 0);
+  const nowMs = Date.now();
+  if (fingerprint && lastFingerprint && fingerprint === lastFingerprint) {
+    logNote("[codex] stop-gate: repository unchanged since the last review — skipping.");
+    logNote(runningTaskNote);
+    return;
+  }
+  if (lastAt && nowMs - lastAt < STOP_REVIEW_COOLDOWN_MS) {
+    const waitS = Math.round((STOP_REVIEW_COOLDOWN_MS - (nowMs - lastAt)) / 1000);
+    logNote(`[codex] stop-gate: cooldown — last review ${Math.round((nowMs - lastAt) / 1000)}s ago, next in ~${waitS}s. Skipping.`);
+    logNote(runningTaskNote);
+    return;
+  }
+  logNote(`[codex] stop-gate review STARTING for ${cwd} (read-only sandbox; up to 15 min; /codex:status to inspect).`);
+  const reviewStartedAt = Date.now();
   const review = runStopReview(cwd, input);
+  recordStopReview(workspaceRoot, fingerprint, nowMs);
+  logNote(`[codex] stop-gate review finished in ${Math.round((Date.now() - reviewStartedAt) / 1000)}s: ${review.ok ? "ALLOW" : "BLOCK"}.`);
   if (!review.ok) {
     emitDecision({
       decision: "block",

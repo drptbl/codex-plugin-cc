@@ -187,7 +187,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    // POLICY (2026-08-31, fork enforcement — the config-proof layer): every
+    // Codex thread this plugin runs is READ-ONLY, forced at the app-server
+    // PROCESS level with a -c override. The per-thread sandbox param alone was
+    // silently defeated by a user-level ~/.codex/config.toml
+    // sandbox_mode = "danger-full-access" (measured live 2026-08-30/31: stop-gate
+    // review jobs wrote engine files for a whole evening despite the per-thread
+    // read-only request). The -c flag outranks config.toml for this process and
+    // leaves the user's interactive codex untouched. Review-only is this
+    // plugin's contract in EVERY repository — findings out, edits never.
+    this.proc = spawn("codex", ["-c", "sandbox_mode=read-only", "app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
