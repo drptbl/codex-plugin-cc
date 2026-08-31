@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
+import { WATCH_INTERVAL_ENV, WATCH_PID_ENV } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -258,9 +259,11 @@ while (rawArgs[argStart] === "-c" && argStart + 1 < rawArgs.length) {
   argStart += 2;
 }
 const args = rawArgs.slice(argStart);
-// Enforce only on a real server launch — probes like "app-server --help"
-// legitimately carry no config overrides.
-if (args[0] === "app-server" && args[1] === undefined && !configOverrides.includes("sandbox_mode=read-only")) {
+// Enforce on every app-server launch except the "--help" availability probe
+// (the one invocation that legitimately carries no config overrides). Keyed on
+// the probe, not on arg arity, so a future launch flag cannot silently skip
+// the read-only contract check.
+if (args[0] === "app-server" && args[1] !== "--help" && !configOverrides.includes("sandbox_mode=read-only")) {
   console.error("fake codex: app-server launched WITHOUT the read-only sandbox override — the 1.2.0 enforcement contract is broken");
   process.exit(1);
 }
@@ -673,7 +676,7 @@ export function buildEnv(binDir) {
     PATH: `${binDir}${sep}${process.env.PATH}`,
     // Any broker a test spawns must die with this test process instead of
     // outliving the run as a detached orphan pair (broker + fake app-server).
-    CODEX_COMPANION_BROKER_WATCH_PID: String(process.pid),
-    CODEX_COMPANION_BROKER_WATCH_INTERVAL_MS: "250"
+    [WATCH_PID_ENV]: String(process.pid),
+    [WATCH_INTERVAL_ENV]: "250"
   };
 }

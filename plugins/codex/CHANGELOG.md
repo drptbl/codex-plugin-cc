@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.3.1 (2026-08-31) — broker lifecycle hardening after adversarial review
+
+A multi-angle review of 1.3.0 found the self-cleanup interacting badly with the
+restart path and with untrusted persisted state. All findings fixed:
+
+- **Ownership established at creation, not inferred at delete**: broker session
+  dirs now carry a sentinel file written by `createBrokerSessionDir`;
+  `isBrokerOwnedSessionDir` checks the sentinel + `cxc-` naming instead of
+  comparing against `os.tmpdir()`. This closes the 1.3.0 bypass where the
+  broker recursively deleted an unvalidated `--session-dir` steered via
+  persisted `broker.json` or `CODEX_COMPANION_APP_SERVER_ENDPOINT`, and it
+  survives TMPDIR divergence between creator and reaper.
+- **File cleanup only on self-initiated exits**: on `broker/shutdown` and
+  SIGTERM/SIGINT the broker closes its runtime but leaves socket/pid/session
+  dir to the requester's teardown — the dying broker can no longer race
+  `restartBrokerSession` and delete the replacement broker's freshly-bound
+  socket during an account switch.
+- **Death signal fixed**: the broker exits on real `codex app-server` process
+  death (`processExitPromise`), not on `exitPromise`, which also resolves on a
+  single unparseable stdout line and would have killed a healthy pair mid-turn.
+- **Fail-safe idle timeout**: only a literal `0` disables reaping; garbage
+  values (`2h`, empty, `-1`) fall back to the 2h default with a logged warning
+  (`parsePositiveInteger` also stopped accepting `parseInt`-style `"2h"` → 2).
+- **Hardened exit machinery**: every exit path routes through one guarded
+  `exitWith`; sockets are destroyed (a half-open peer can no longer wedge
+  `server.close()` forever); file removal is force-tolerant.
+- **No stale state after self-reap**: the broker clears the workspace
+  `broker.json` (only while it still points at its own endpoint), so
+  `reuseExistingBroker` callers stop dialing dead endpoints and misreporting
+  auth/rate-limit state after an idle reap.
+- **Failed restarts no longer leak** their `cxc-*` dir (the failure teardown
+  now names the session dir, reclaimed under the ownership guard).
+- **Test fixture**: the read-only contract check is keyed on the `--help`
+  probe, not arg arity, so a future launch flag cannot silently skip it; env
+  names come from the exported constants.
+- Scope note: `--watch-pid` is an embedder/test facility with no producer in
+  normal plugin use — in production the crash-path backstop is the idle
+  timeout (plus the SessionEnd hook for clean exits).
+
 ## 1.3.0 (2026-08-31) — broker lifecycle: orphaned runtimes reap themselves
 
 Born from a live leak: 58 orphaned broker + `codex app-server` process pairs

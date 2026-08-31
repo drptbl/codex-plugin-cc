@@ -215,6 +215,14 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(error);
     });
 
+    // Resolves only when the codex app-server PROCESS is gone (exit or spawn
+    // failure). exitPromise also resolves on protocol-level failures such as
+    // an unparseable stdout line, so it must not be used as a death signal.
+    this.processExitPromise = new Promise((resolve) => {
+      this.proc.on("exit", () => resolve(undefined));
+      this.proc.on("error", () => resolve(undefined));
+    });
+
     this.proc.on("exit", (code, signal) => {
       const stderr = this.stderr.trim();
       const detail =

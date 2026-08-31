@@ -17,33 +17,60 @@ export const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const BROKER_STATE_FILE = "broker.json";
 
 const BROKER_SESSION_DIR_PREFIX = "cxc-";
+const BROKER_SESSION_DIR_SENTINEL = ".codex-companion-broker";
 
 export function parsePositiveInteger(value) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
+  const raw = String(value ?? "").trim();
+  // Number() rejects trailing junk ("2h") that parseInt would silently accept.
+  const parsed = raw === "" ? Number.NaN : Number(raw);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+// A malformed idle-timeout value must fail SAFE: only an explicit "0" turns
+// the reaper off; garbage ("2h", "", "-1") falls back to the default so a
+// typo cannot silently disable the one crash backstop production has.
+export function resolveIdleTimeoutMs(rawValue, defaultMs) {
+  if (rawValue === undefined) {
+    return { ms: defaultMs, invalid: false };
+  }
+  if (String(rawValue).trim() === "0") {
+    return { ms: 0, invalid: false };
+  }
+  const parsed = parsePositiveInteger(rawValue);
+  return parsed === null ? { ms: defaultMs, invalid: true } : { ms: parsed, invalid: false };
 }
 
 function resolveWatchPid(env) {
   return parsePositiveInteger(env?.[WATCH_PID_ENV]);
 }
 
-export function createBrokerSessionDir(prefix = BROKER_SESSION_DIR_PREFIX) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+function isBrokerNamedDir(dir) {
+  return path.basename(path.resolve(dir)).startsWith(BROKER_SESSION_DIR_PREFIX);
 }
 
-// A session dir is only trusted for recursive removal when it is really one of
-// our mkdtemp dirs: directly under the OS temp root with the broker prefix.
-// The value can arrive from persisted broker.json state, which on a shared
-// tmp-backed state root must not be able to steer a recursive delete anywhere
-// else.
+export function markBrokerSessionDir(sessionDir) {
+  fs.writeFileSync(path.join(sessionDir, BROKER_SESSION_DIR_SENTINEL), "", "utf8");
+}
+
+export function createBrokerSessionDir(prefix = BROKER_SESSION_DIR_PREFIX) {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  markBrokerSessionDir(sessionDir);
+  return sessionDir;
+}
+
+// A session dir is only trusted for recursive removal when ownership was
+// established at creation time: the broker prefix in the name plus the
+// sentinel file markBrokerSessionDir wrote into it. The value can arrive from
+// persisted broker.json state or broker argv, which must not be able to steer
+// a recursive delete anywhere else — and unlike a path-shape check against
+// os.tmpdir(), the sentinel stays valid when the reaping process runs with a
+// different TMPDIR than the creator.
 export function isBrokerOwnedSessionDir(sessionDir) {
   if (!sessionDir) {
     return false;
   }
   try {
-    const resolved = fs.realpathSync(sessionDir);
-    const tmpRoot = fs.realpathSync(os.tmpdir());
-    return path.dirname(resolved) === tmpRoot && path.basename(resolved).startsWith(BROKER_SESSION_DIR_PREFIX);
+    return isBrokerNamedDir(sessionDir) && fs.existsSync(path.join(sessionDir, BROKER_SESSION_DIR_SENTINEL));
   } catch {
     return false;
   }
@@ -241,18 +268,18 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  // Recursive removal is reserved for dirs proven to be broker-owned mkdtemp
-  // dirs; anything else (a dir derived from pidFile/logFile, or a persisted
-  // sessionDir that fails validation) is only removed once empty.
+  // Recursive removal is reserved for dirs that prove broker ownership via
+  // the creation-time sentinel; anything else (a persisted or derived path
+  // that fails validation) is only removed once empty.
   const resolvedSessionDir =
     sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
   if (!resolvedSessionDir || !fs.existsSync(resolvedSessionDir)) {
     return;
   }
 
-  if (sessionDir && isBrokerOwnedSessionDir(sessionDir)) {
+  if (isBrokerOwnedSessionDir(resolvedSessionDir)) {
     try {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
+      fs.rmSync(resolvedSessionDir, { recursive: true, force: true });
     } catch {
       // Ignore races with a broker removing its own session dir.
     }
@@ -308,9 +335,17 @@ export async function restartBrokerSession(cwd, options = {}) {
   // teardownBrokerSession resolves a session dir from pidFile's dirname even
   // when passed sessionDir: null, and rmdirs it once emptied — so the endpoint
   // directory may be GONE here. The respawned broker must bind into an
-  // existing dir (a missing one surfaces as EACCES on macOS).
+  // existing dir (a missing one surfaces as EACCES on macOS). When we create
+  // the dir fresh and it carries our mkdtemp naming, re-establish ownership so
+  // the respawned broker's self-cleanup can reclaim it; a pre-existing dir
+  // keeps whatever ownership marker it already has (a user-supplied endpoint
+  // dir must never be claimed).
   if (endpointDir) {
+    const existedBefore = fs.existsSync(endpointDir);
     fs.mkdirSync(endpointDir, { recursive: true });
+    if (!existedBefore && isBrokerNamedDir(endpointDir)) {
+      markBrokerSessionDir(endpointDir);
+    }
   }
 
   const scriptPath =
@@ -329,12 +364,14 @@ export async function restartBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 5000);
   if (!ready) {
-    // Mirror ensureBrokerSession: never leak a half-spawned broker.
+    // Mirror ensureBrokerSession: never leak a half-spawned broker. Passing
+    // the known sessionDir lets the ownership-guarded recursive removal
+    // reclaim the dir even though broker.log makes it non-empty.
     teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
-      sessionDir: null,
+      sessionDir,
       pid: child?.pid ?? null,
       killProcess: options.killProcess ?? terminateProcessTree
     });
