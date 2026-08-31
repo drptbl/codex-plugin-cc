@@ -11,6 +11,7 @@ import {
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
+  sweepStaleBrokerSessionDirs,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
@@ -111,6 +112,15 @@ async function handleSessionEnd(input) {
     killProcess: terminateProcessTree
   });
   clearBrokerSession(cwd);
+
+  // Reclaim session dirs that escaped every teardown path (crashed brokers,
+  // pre-sentinel dirs, partial removals) — bounded, liveness-gated, and
+  // best-effort so it can never fail the hook.
+  try {
+    sweepStaleBrokerSessionDirs();
+  } catch {
+    // Sweeping is opportunistic housekeeping only.
+  }
 }
 
 async function main() {

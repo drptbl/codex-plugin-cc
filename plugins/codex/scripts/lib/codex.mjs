@@ -620,9 +620,19 @@ async function withAppServer(cwd, fn) {
     return result;
   } catch (error) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    // Transport-level broker failures retry direct; RPC-level errors (which
+    // carry rpcCode) surface to the caller. ECONNRESET and the code-less
+    // "connection closed" are what a self-reaping broker's socket.destroy()
+    // produces on a client caught mid-request.
+    const transportFailure =
+      error?.code === "ENOENT" ||
+      error?.code === "ECONNREFUSED" ||
+      error?.code === "ECONNRESET" ||
+      error?.code === "EPIPE" ||
+      (error?.rpcCode === undefined && /connection closed/i.test(error?.message ?? ""));
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (brokerRequested && transportFailure);
 
     if (client) {
       await client.close().catch(() => {});

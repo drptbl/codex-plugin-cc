@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, isBrokerEndpointReady, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -277,6 +277,21 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
           }
         }
       }, 50).unref?.();
+      // Escalate: a child that ignores SIGTERM must not block this close (and
+      // with it every broker exit path) forever.
+      setTimeout(() => {
+        if (this.proc && this.proc.exitCode === null) {
+          try {
+            if (process.platform === "win32") {
+              terminateProcessTree(this.proc.pid);
+            } else {
+              this.proc.kill("SIGKILL");
+            }
+          } catch {
+            // Best-effort escalation — swallow errors during shutdown.
+          }
+        }
+      }, 2000).unref?.();
     }
 
     await this.exitPromise;
@@ -356,6 +371,13 @@ export class CodexAppServerClient {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+      }
+      if (brokerEndpoint && options.reuseExistingBroker && !(await isBrokerEndpointReady(brokerEndpoint))) {
+        // A broker that died without its SessionEnd hook (reboot, SIGKILL,
+        // external SIGTERM) leaves a stale endpoint behind. reuse callers are
+        // status/interrupt paths that must not misreport off a dead socket —
+        // fall through to a direct app-server spawn instead.
+        brokerEndpoint = null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });

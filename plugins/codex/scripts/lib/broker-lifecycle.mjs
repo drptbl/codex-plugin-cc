@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { terminateProcessTree } from "./process.mjs";
+import { isProcessAlive, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -17,13 +17,20 @@ export const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const BROKER_STATE_FILE = "broker.json";
 
 const BROKER_SESSION_DIR_PREFIX = "cxc-";
-const BROKER_SESSION_DIR_SENTINEL = ".codex-companion-broker";
+export const BROKER_SESSION_DIR_SENTINEL = ".codex-companion-broker";
+// setInterval/setTimeout clamp anything above 2^31-1 to 1ms — a value that
+// large would turn the watchdog into a busy loop, so reject it at the parse.
+const MAX_PARSED_INTEGER = 2 ** 31 - 1;
 
 export function parsePositiveInteger(value) {
   const raw = String(value ?? "").trim();
-  // Number() rejects trailing junk ("2h") that parseInt would silently accept.
-  const parsed = raw === "" ? Number.NaN : Number(raw);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  // Decimal digits only: Number() alone would accept hex ("0x1F4") and
+  // exponent ("1e9") forms, and parseInt would accept trailing junk ("2h").
+  if (!/^[0-9]+$/.test(raw)) {
+    return null;
+  }
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= MAX_PARSED_INTEGER ? parsed : null;
 }
 
 // A malformed idle-timeout value must fail SAFE: only an explicit "0" turns
@@ -52,8 +59,8 @@ export function markBrokerSessionDir(sessionDir) {
   fs.writeFileSync(path.join(sessionDir, BROKER_SESSION_DIR_SENTINEL), "", "utf8");
 }
 
-export function createBrokerSessionDir(prefix = BROKER_SESSION_DIR_PREFIX) {
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+export function createBrokerSessionDir() {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), BROKER_SESSION_DIR_PREFIX));
   markBrokerSessionDir(sessionDir);
   return sessionDir;
 }
@@ -100,20 +107,43 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
+export async function sendBrokerShutdown(endpoint, timeoutMs = 2000) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    // A wedged broker can accept the connection and never answer; the caller
+    // (notably the SessionEnd hook) must not hang on it — the kill path in
+    // teardownBrokerSession covers a broker that ignores the RPC.
+    const deadline = setTimeout(() => {
+      socket.destroy();
+      resolve();
+    }, timeoutMs);
+    deadline.unref?.();
+    const finish = () => {
+      clearTimeout(deadline);
+      resolve();
+    };
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
       socket.end();
-      resolve();
+      finish();
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", finish);
+    socket.on("close", finish);
   });
+}
+
+export async function waitForProcessExit(pid, timeoutMs = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !isProcessAlive(pid);
 }
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, sessionDir = null, watchPid = null, env = process.env }) {
@@ -160,13 +190,10 @@ export function saveBrokerSession(cwd, session) {
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
-  }
+  fs.rmSync(resolveBrokerStateFile(cwd), { force: true });
 }
 
-async function isBrokerEndpointReady(endpoint) {
+export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
   }
@@ -218,13 +245,15 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
+    // The child is ours and failed to become ready — kill it, or a slow-boot
+    // broker that binds after this timeout survives as an unowned orphan.
     teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess: options.killProcess ?? terminateProcessTree
     });
     return null;
   }
@@ -240,7 +269,15 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
+export function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  removeSessionDir = true,
+  pid = null,
+  killProcess = null
+}) {
   if (Number.isFinite(pid) && killProcess) {
     try {
       killProcess(pid);
@@ -249,41 +286,66 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+  // force-tolerant removals: a broker reaping itself concurrently must not be
+  // able to crash this teardown between an existence check and an unlink.
+  if (pidFile) {
+    try {
+      fs.rmSync(pidFile, { force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
   }
 
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  if (logFile) {
+    try {
+      fs.rmSync(logFile, { force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
-        fs.unlinkSync(target.path);
+      if (target.kind === "unix") {
+        fs.rmSync(target.path, { force: true });
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.
     }
   }
 
-  // Recursive removal is reserved for dirs that prove broker ownership via
-  // the creation-time sentinel; anything else (a persisted or derived path
-  // that fails validation) is only removed once empty.
+  if (!removeSessionDir) {
+    return;
+  }
+
+  // Recursive removal is reserved for an EXPLICITLY passed session dir that
+  // proves broker ownership via the creation-time sentinel. A dir merely
+  // derived from pidFile/logFile can be steered through env vars, so it is
+  // never recursed into: at most our own sentinel file is removed and the
+  // then-empty dir rmdir'd. Anything that escapes this (a dir left non-empty)
+  // is reclaimed later by sweepStaleBrokerSessionDirs.
   const resolvedSessionDir =
     sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
-  if (!resolvedSessionDir || !fs.existsSync(resolvedSessionDir)) {
+  if (!resolvedSessionDir) {
+    return;
+  }
+
+  if (sessionDir && isBrokerOwnedSessionDir(sessionDir)) {
+    try {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch {
+      // Ignore races with a broker removing its own session dir.
+    }
     return;
   }
 
   if (isBrokerOwnedSessionDir(resolvedSessionDir)) {
     try {
-      fs.rmSync(resolvedSessionDir, { recursive: true, force: true });
+      fs.rmSync(path.join(resolvedSessionDir, BROKER_SESSION_DIR_SENTINEL), { force: true });
     } catch {
-      // Ignore races with a broker removing its own session dir.
+      // Best-effort cleanup.
     }
-    return;
   }
 
   try {
@@ -293,13 +355,74 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
   }
 }
 
+// Reclaims broker session dirs that escaped every teardown path: dirs from
+// crashed/SIGKILLed brokers, pre-sentinel (1.3.0) dirs, and partially removed
+// ones. Paths are constructed from our own enumeration of the OS temp root —
+// never from persisted state — so removal here cannot be steered elsewhere.
+// A dir is stale when its recorded broker pid is dead; a dir with no readable
+// pid is age-gated so one that is mid-creation is never swept.
+export function sweepStaleBrokerSessionDirs(options = {}) {
+  const maxEntries = options.maxEntries ?? 50;
+  const minAgeMs = options.minAgeMs ?? 24 * 60 * 60 * 1000;
+  const tmpRoot = os.tmpdir();
+  let names;
+  try {
+    names = fs.readdirSync(tmpRoot);
+  } catch {
+    return { examined: 0, removed: 0 };
+  }
+
+  let examined = 0;
+  let removed = 0;
+  for (const name of names) {
+    if (!name.startsWith(BROKER_SESSION_DIR_PREFIX)) {
+      continue;
+    }
+    if (examined >= maxEntries) {
+      break;
+    }
+    examined += 1;
+    const dir = path.join(tmpRoot, name);
+    try {
+      const stats = fs.lstatSync(dir);
+      if (!stats.isDirectory()) {
+        continue;
+      }
+      let pidRaw = null;
+      try {
+        pidRaw = fs.readFileSync(path.join(dir, "broker.pid"), "utf8");
+      } catch {
+        pidRaw = null;
+      }
+      const brokerPid = parsePositiveInteger(pidRaw);
+      if (brokerPid) {
+        if (isProcessAlive(brokerPid)) {
+          continue;
+        }
+      } else if (Date.now() - stats.mtimeMs < minAgeMs) {
+        continue;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Skip entries we cannot inspect or remove.
+    }
+  }
+  return { examined, removed };
+}
+
 export async function restartBrokerSession(cwd, options = {}) {
   const env = options.env ?? process.env;
-  const existing = loadBrokerSession(cwd);
-  const endpoint = options.endpoint ?? existing?.endpoint ?? null;
+  const stored = loadBrokerSession(cwd);
+  const endpoint = options.endpoint ?? stored?.endpoint ?? null;
   if (!endpoint) {
     return null;
   }
+
+  // Only trust the stored record when it describes the SAME endpoint being
+  // restarted — inheriting pid/paths from a non-matching record would kill
+  // and delete an unrelated broker's runtime.
+  const existing = stored && stored.endpoint === endpoint ? stored : null;
 
   // Endpoints are URIs (`unix:/path/broker.sock`, `pipe:...` — see
   // broker-endpoint.mjs); every filesystem operation works on the PARSED path,
@@ -318,33 +441,34 @@ export async function restartBrokerSession(cwd, options = {}) {
   const pid = existing?.pid ?? null;
 
   await sendBrokerShutdown(endpoint).catch(() => {});
+  // The replacement rebinds into the SAME dir, so keep it (sentinel included)
+  // and remove only the runtime files.
   teardownBrokerSession({
     endpoint,
     pidFile,
     logFile,
-    sessionDir: null,
+    sessionDir,
+    removeSessionDir: false,
     pid,
     killProcess: options.killProcess ?? terminateProcessTree
   });
   clearBrokerSession(cwd);
 
-  if (parsed.kind === "unix" && fs.existsSync(parsed.path)) {
-    fs.rmSync(parsed.path, { force: true });
+  // Do not rebind while the outgoing broker can still be running its exit
+  // path — its late cleanup must never overlap the replacement's files.
+  if (pid) {
+    await waitForProcessExit(pid, options.predecessorExitTimeoutMs ?? 2000);
   }
 
-  // teardownBrokerSession resolves a session dir from pidFile's dirname even
-  // when passed sessionDir: null, and rmdirs it once emptied — so the endpoint
-  // directory may be GONE here. The respawned broker must bind into an
-  // existing dir (a missing one surfaces as EACCES on macOS). When we create
-  // the dir fresh and it carries our mkdtemp naming, re-establish ownership so
-  // the respawned broker's self-cleanup can reclaim it; a pre-existing dir
-  // keeps whatever ownership marker it already has (a user-supplied endpoint
-  // dir must never be claimed).
-  if (endpointDir) {
-    const existedBefore = fs.existsSync(endpointDir);
-    fs.mkdirSync(endpointDir, { recursive: true });
-    if (!existedBefore && isBrokerNamedDir(endpointDir)) {
-      markBrokerSessionDir(endpointDir);
+  // The session dir normally survives the teardown above. If something else
+  // removed it, recreate it with mkdtemp's 0700 (the socket's only access
+  // control) and re-claim ownership only for a dir created fresh under our
+  // own naming — a user-supplied endpoint dir must never be claimed.
+  const bindDir = sessionDir ?? endpointDir;
+  if (bindDir && !fs.existsSync(bindDir)) {
+    fs.mkdirSync(bindDir, { recursive: true, mode: 0o700 });
+    if (isBrokerNamedDir(bindDir)) {
+      markBrokerSessionDir(bindDir);
     }
   }
 

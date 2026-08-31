@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { isProcessAlive } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1615,14 +1616,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
   assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled");
 
-  await waitFor(() => {
-    try {
-      process.kill(sleeper.pid, 0);
-      return false;
-    } catch (error) {
-      return error?.code === "ESRCH";
-    }
-  });
+  await waitFor(() => !isProcessAlive(sleeper.pid));
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   const cancelled = state.jobs.find((job) => job.id === "task-live");
@@ -1908,14 +1902,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
   );
 
-  await waitFor(() => {
-    try {
-      process.kill(sleeper.pid, 0);
-      return false;
-    } catch (error) {
-      return error?.code === "ESRCH";
-    }
-  });
+  await waitFor(() => !isProcessAlive(sleeper.pid));
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);

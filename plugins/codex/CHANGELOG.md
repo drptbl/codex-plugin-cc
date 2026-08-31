@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.4.0 (2026-08-31) — broker lifecycle: second adversarial review round
+
+A second multi-angle review of the 1.3.x work, run before re-enabling the
+plugin, found that parts of the 1.3.1 hardening did not hold. All findings
+fixed and regression-tested:
+
+- **The socket file now truly survives external shutdowns**: a graceful
+  `server.close()` makes libuv unlink the unix-socket *path* — including one a
+  replacement broker has already re-bound (verified empirically). The broker
+  no longer closes its listener on any exit path; `process.exit` releases the
+  fd without touching the path, so who deletes the file is decided solely by
+  the exit mode. The restart regression test now asserts socket survival.
+- **Nothing can keep a dying broker alive**: every exit path arms a 5s
+  failsafe timer, `appClient.close()` escalates SIGTERM → SIGKILL after 2s,
+  and crash routes (`server` errors, uncaught exceptions, unhandled
+  rejections) run the same cleanup as any self-initiated exit.
+- **Restart no longer races its predecessor**: teardown gained an explicit
+  `removeSessionDir` contract (restart keeps the dir + sentinel instead of the
+  delete/recreate/re-mark dance — also fixing the Windows pipe path, which
+  deleted the dir and then threw ENOENT out of `restartBrokerSession`), the
+  restart waits for the old broker pid to actually exit before rebinding, a
+  group-SIGTERM flag keeps external kills out of the file-removal branch, and
+  the state-file guard is keyed on the broker's own pid (the endpoint string
+  is reused by the successor). A dir recreated on the rare fallback path gets
+  mkdtemp's 0700 back instead of umask 0755.
+- **Recursive deletion is explicit-only again**: a session dir merely derived
+  from `pidFile`/`logFile` (steerable via env vars) is never recursed into —
+  at most our sentinel file is removed and the then-empty dir rmdir'd.
+- **Stale endpoints stop lying**: `reuseExistingBroker` callers probe the
+  persisted endpoint and fall back to a direct app-server spawn when it is
+  dead (no more spurious "not logged in" after a reboot/pkill), and the
+  broker-failure retry now also covers ECONNRESET/"connection closed".
+- **Escaped dirs get reaped**: SessionEnd runs a bounded, liveness-gated sweep
+  of `os.tmpdir()/cxc-*` — reclaiming crashed-broker dirs, pre-sentinel 1.3.0
+  dirs (the upgrade path), and partial removals. Restart mismatches are also
+  closed: a stored record is only trusted when it names the endpoint being
+  restarted, and a failed `ensureBrokerSession` spawn now kills its child.
+- Hygiene: `parsePositiveInteger` accepts plain decimal only (no `0x`/`1e`
+  forms that could clamp timers into busy loops), an invalid `--watch-pid`
+  logs instead of silently dropping the liveness tie, `sendBrokerShutdown` is
+  time-bounded so the SessionEnd hook can never hang on a wedged broker, and
+  teardown/clear use force-tolerant removals that cannot crash the hook when
+  racing a self-reaping broker.
+
 ## 1.3.1 (2026-08-31) — broker lifecycle hardening after adversarial review
 
 A multi-angle review of 1.3.0 found the self-cleanup interacting badly with the
