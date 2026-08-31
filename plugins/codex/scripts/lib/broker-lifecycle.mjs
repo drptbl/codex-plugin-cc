@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -206,4 +207,75 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
       // Ignore non-empty or missing directories.
     }
   }
+}
+
+export async function restartBrokerSession(cwd, options = {}) {
+  const env = options.env ?? process.env;
+  const existing = loadBrokerSession(cwd);
+  const endpoint = options.endpoint ?? existing?.endpoint ?? null;
+  if (!endpoint) {
+    return null;
+  }
+
+  // Endpoints are URIs (`unix:/path/broker.sock`, `pipe:...` — see
+  // broker-endpoint.mjs); every filesystem operation works on the PARSED path,
+  // never the URI string.
+  const parsed = parseBrokerEndpoint(endpoint);
+  const endpointDir = parsed.kind === "unix" ? path.dirname(parsed.path) : null;
+  const pidFile =
+    existing?.pidFile ??
+    env[PID_FILE_ENV] ??
+    (endpointDir ? path.join(endpointDir, "broker.pid") : null);
+  const logFile =
+    existing?.logFile ??
+    env[LOG_FILE_ENV] ??
+    (endpointDir ? path.join(endpointDir, "broker.log") : null);
+  const sessionDir = existing?.sessionDir ?? endpointDir;
+  const pid = existing?.pid ?? null;
+
+  await sendBrokerShutdown(endpoint).catch(() => {});
+  teardownBrokerSession({
+    endpoint,
+    pidFile,
+    logFile,
+    sessionDir: null,
+    pid,
+    killProcess: options.killProcess ?? terminateProcessTree
+  });
+  clearBrokerSession(cwd);
+
+  if (parsed.kind === "unix" && fs.existsSync(parsed.path)) {
+    fs.rmSync(parsed.path, { force: true });
+  }
+
+  // teardownBrokerSession resolves a session dir from pidFile's dirname even
+  // when passed sessionDir: null, and rmdirs it once emptied — so the endpoint
+  // directory may be GONE here. The respawned broker must bind into an
+  // existing dir (a missing one surfaces as EACCES on macOS).
+  if (endpointDir) {
+    fs.mkdirSync(endpointDir, { recursive: true });
+  }
+
+  const scriptPath =
+    options.scriptPath ?? fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  const spawnProcess = options.spawnProcess ?? spawnBrokerProcess;
+  const child = spawnProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env });
+
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 5000);
+  if (!ready) {
+    // Mirror ensureBrokerSession: never leak a half-spawned broker.
+    teardownBrokerSession({
+      endpoint,
+      pidFile,
+      logFile,
+      sessionDir: null,
+      pid: child?.pid ?? null,
+      killProcess: options.killProcess ?? terminateProcessTree
+    });
+    return null;
+  }
+
+  const session = { endpoint, pidFile, logFile, sessionDir, pid: child.pid ?? null };
+  saveBrokerSession(cwd, session);
+  return session;
 }
