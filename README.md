@@ -1,3 +1,22 @@
+# codex-plugin-cc (fork: review-only + auto account switching)
+
+This is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
+with two changes:
+
+- **Review-only policy** — Codex runs in a read-only sandbox unconditionally: it
+  reviews, diagnoses, and returns findings/patch proposals; the host Claude
+  session makes every edit itself. The rescue agent never passes `--write`.
+- **Automatic account switching** (off by default) — with two or more ChatGPT
+  accounts registered via [`codex-auth`](https://github.com/loongphy/codex-auth)
+  (`npm install -g @loongphy/codex-auth`, then `codex-auth login` per account —
+  users configure their own accounts), enabling `/codex:setup
+  --enable-auto-account-switch` makes the plugin switch to the least-used
+  account when the active one crosses the usage threshold (default 95%,
+  `--auto-switch-threshold`) or a run fails with a usage-limit error — then it
+  restarts the shared Codex runtime and retries once.
+
+---
+
 # Codex plugin for Claude Code
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
