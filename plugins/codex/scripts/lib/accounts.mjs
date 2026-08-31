@@ -4,7 +4,9 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { binaryAvailable } from "./process.mjs";
-import { CodexAppServerClient } from "./app-server.mjs";
+import { BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { restartBrokerSession } from "./broker-lifecycle.mjs";
+import { getConfig } from "./state.mjs";
 
 const CODEX_AUTH_BINARY = "codex-auth";
 
@@ -164,4 +166,93 @@ export async function readActiveRateLimits(cwd) {
   } finally {
     await client?.close().catch(() => {});
   }
+}
+
+function notify(onProgress, message) {
+  if (onProgress && message) {
+    onProgress(message);
+  }
+}
+
+async function defaultRestartRuntime(cwd) {
+  return restartBrokerSession(cwd, {
+    endpoint: process.env[BROKER_ENDPOINT_ENV] ?? null
+  });
+}
+
+function orchestrationDeps(overrides = {}) {
+  return {
+    getConfig,
+    readAccountRegistry,
+    readActiveRateLimits,
+    switchActiveAccount,
+    restartRuntime: defaultRestartRuntime,
+    ...overrides
+  };
+}
+
+async function performSwitch(cwd, deps, fallback, onProgress) {
+  notify(
+    onProgress,
+    `Codex account limit handling: switching to ${fallback.email} and restarting the Codex runtime.`
+  );
+  await deps.restartRuntime(cwd);
+  const switchResult = deps.switchActiveAccount(fallback);
+  if (!switchResult.switched) {
+    notify(onProgress, `Codex account switch failed: ${switchResult.detail}`);
+    return { switched: false, reason: "switch-failed" };
+  }
+  notify(onProgress, switchResult.detail);
+  return { switched: true, reason: "switched", toAccount: fallback.accountKey };
+}
+
+export async function maybeAutoSwitchAccount(cwd, options = {}) {
+  const deps = orchestrationDeps(options.deps);
+  const config = deps.getConfig(cwd);
+  if (!config.autoAccountSwitch) {
+    return { switched: false, reason: "disabled" };
+  }
+
+  const registry = deps.readAccountRegistry();
+  if (!registry.available) {
+    return { switched: false, reason: "codex-auth-unavailable" };
+  }
+
+  const threshold = config.autoAccountSwitchThresholdPercent;
+  const active = registry.accounts.find((account) => account.active) ?? null;
+  const limits = await deps.readActiveRateLimits(cwd);
+  const activeUsed = Math.max(
+    limits.primaryUsedPercent ?? active?.primaryUsedPercent ?? 0,
+    limits.secondaryUsedPercent ?? active?.secondaryUsedPercent ?? 0
+  );
+  if (activeUsed < threshold) {
+    return { switched: false, reason: "under-threshold" };
+  }
+
+  const fallback = pickFallbackAccount(registry);
+  if (!fallback) {
+    return { switched: false, reason: "no-fallback" };
+  }
+
+  return performSwitch(cwd, deps, fallback, options.onProgress);
+}
+
+export async function switchToFallbackAccount(cwd, options = {}) {
+  const deps = orchestrationDeps(options.deps);
+  const config = deps.getConfig(cwd);
+  if (!config.autoAccountSwitch) {
+    return { switched: false, reason: "disabled" };
+  }
+
+  const registry = deps.readAccountRegistry();
+  if (!registry.available) {
+    return { switched: false, reason: "codex-auth-unavailable" };
+  }
+
+  const fallback = pickFallbackAccount(registry);
+  if (!fallback) {
+    return { switched: false, reason: "no-fallback" };
+  }
+
+  return performSwitch(cwd, deps, fallback, options.onProgress);
 }

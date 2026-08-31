@@ -8,10 +8,12 @@ import { fileURLToPath } from "node:url";
 import { makeTempDir } from "./helpers.mjs";
 import {
   isUsageLimitError,
+  maybeAutoSwitchAccount,
   normalizeRateLimits,
   pickFallbackAccount,
   readAccountRegistry,
-  switchActiveAccount
+  switchActiveAccount,
+  switchToFallbackAccount
 } from "../plugins/codex/scripts/lib/accounts.mjs";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -177,4 +179,95 @@ test("normalizeRateLimits returns nulls for unknown shapes", () => {
     primaryUsedPercent: null,
     secondaryUsedPercent: null
   });
+});
+
+function orchestrationDeps(overrides = {}) {
+  const registry = readAccountRegistry({ registryPath: REGISTRY_FIXTURE_PATH });
+  const calls = { switched: [], restarted: 0 };
+  return {
+    calls,
+    deps: {
+      getConfig: () => ({ autoAccountSwitch: true, autoAccountSwitchThresholdPercent: 95 }),
+      readAccountRegistry: () => registry,
+      readActiveRateLimits: async () => ({ primaryUsedPercent: 99, secondaryUsedPercent: 99 }),
+      switchActiveAccount: (target) => {
+        calls.switched.push(target.accountKey);
+        return { switched: true, detail: `switched to ${target.email}` };
+      },
+      restartRuntime: async () => {
+        calls.restarted += 1;
+        return null;
+      },
+      ...overrides
+    }
+  };
+}
+
+test("maybeAutoSwitchAccount switches when active usage crosses the threshold", async () => {
+  const { deps, calls } = orchestrationDeps();
+  const result = await maybeAutoSwitchAccount("/tmp/workspace", { deps });
+  assert.equal(result.switched, true);
+  assert.equal(result.toAccount, "acct-key-a");
+  assert.deepEqual(calls.switched, ["acct-key-a"]);
+  assert.equal(calls.restarted, 1);
+});
+
+test("maybeAutoSwitchAccount is a no-op when the feature is disabled", async () => {
+  const { deps, calls } = orchestrationDeps({
+    getConfig: () => ({ autoAccountSwitch: false, autoAccountSwitchThresholdPercent: 95 })
+  });
+  const result = await maybeAutoSwitchAccount("/tmp/workspace", { deps });
+  assert.equal(result.switched, false);
+  assert.equal(result.reason, "disabled");
+  assert.deepEqual(calls.switched, []);
+});
+
+test("maybeAutoSwitchAccount stays put under the threshold", async () => {
+  const { deps, calls } = orchestrationDeps({
+    readActiveRateLimits: async () => ({ primaryUsedPercent: 40, secondaryUsedPercent: 10 })
+  });
+  const result = await maybeAutoSwitchAccount("/tmp/workspace", { deps });
+  assert.equal(result.switched, false);
+  assert.equal(result.reason, "under-threshold");
+  assert.deepEqual(calls.switched, []);
+});
+
+test("maybeAutoSwitchAccount falls back to registry usage when rate limits are unknown", async () => {
+  const { deps } = orchestrationDeps({
+    readActiveRateLimits: async () => ({ primaryUsedPercent: null, secondaryUsedPercent: null })
+  });
+  // Registry says the active account (acct-key-b) is at 99% -> still switches.
+  const result = await maybeAutoSwitchAccount("/tmp/workspace", { deps });
+  assert.equal(result.switched, true);
+});
+
+test("switchToFallbackAccount switches without a threshold check", async () => {
+  const { deps, calls } = orchestrationDeps({
+    readActiveRateLimits: async () => ({ primaryUsedPercent: null, secondaryUsedPercent: null })
+  });
+  const result = await switchToFallbackAccount("/tmp/workspace", { deps });
+  assert.equal(result.switched, true);
+  assert.deepEqual(calls.switched, ["acct-key-a"]);
+  assert.equal(calls.restarted, 1);
+});
+
+test("switchToFallbackAccount refuses when no other account exists", async () => {
+  const { deps, calls } = orchestrationDeps();
+  deps.readAccountRegistry = () => ({
+    available: true,
+    activeAccountKey: "acct-key-b",
+    accounts: [
+      {
+        accountKey: "acct-key-b",
+        email: "account-b@example.com",
+        active: true,
+        primaryUsedPercent: 99,
+        secondaryUsedPercent: 99
+      }
+    ]
+  });
+  const result = await switchToFallbackAccount("/tmp/workspace", { deps });
+  assert.equal(result.switched, false);
+  assert.equal(result.reason, "no-fallback");
+  assert.deepEqual(calls.switched, []);
 });
