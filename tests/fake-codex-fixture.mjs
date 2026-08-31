@@ -249,7 +249,7 @@ function taskPayload(prompt, resume) {
 
 const rawArgs = process.argv.slice(2);
 // 1.2.0 (review-only enforcement): the plugin launches every app-server with
-// leading `-c key=value` config overrides — REQUIRE the read-only override so
+// leading "-c key=value" config overrides — REQUIRE the read-only override so
 // the suite pins the enforcement contract, then strip the pairs for dispatch.
 const configOverrides = [];
 let argStart = 0;
@@ -258,7 +258,9 @@ while (rawArgs[argStart] === "-c" && argStart + 1 < rawArgs.length) {
   argStart += 2;
 }
 const args = rawArgs.slice(argStart);
-if (args[0] === "app-server" && !configOverrides.includes("sandbox_mode=read-only")) {
+// Enforce only on a real server launch — probes like "app-server --help"
+// legitimately carry no config overrides.
+if (args[0] === "app-server" && args[1] === undefined && !configOverrides.includes("sandbox_mode=read-only")) {
   console.error("fake codex: app-server launched WITHOUT the read-only sandbox override — the 1.2.0 enforcement contract is broken");
   process.exit(1);
 }
@@ -286,6 +288,7 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPid = process.pid;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -667,6 +670,10 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Any broker a test spawns must die with this test process instead of
+    // outliving the run as a detached orphan pair (broker + fake app-server).
+    CODEX_COMPANION_BROKER_WATCH_PID: String(process.pid),
+    CODEX_COMPANION_BROKER_WATCH_INTERVAL_MS: "250"
   };
 }

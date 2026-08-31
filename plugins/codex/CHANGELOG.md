@@ -1,24 +1,35 @@
 # Changelog
 
-## 1.1.0 (fork)
+## 1.3.0 (2026-08-31) — broker lifecycle: orphaned runtimes reap themselves
 
-- **Automatic account switching** (off by default): when `autoAccountSwitch` is
-  enabled and the active ChatGPT account crosses the usage threshold (or a run
-  fails with a usage-limit error), the plugin switches to the least-used account
-  stored by `codex-auth`, restarts the shared Codex runtime on its existing
-  endpoint, and retries once. New setup flags: `--enable-auto-account-switch`,
-  `--disable-auto-account-switch`, `--auto-switch-threshold <percent>`. Requires
-  `npm install -g @loongphy/codex-auth` and accounts registered by the user via
-  `codex-auth login` / `codex-auth import`.
-- **Review-only policy**: the sandbox is forced read-only at the plugin's single
-  write surface — Codex reviews, diagnoses, and proposes patches; the host
-  session applies edits itself. The rescue agent never passes `--write`.
-- Fix: `restartBrokerSession` recreates the endpoint directory before respawn
-  (teardown removes it once emptied) and never leaks a half-spawned broker.
+Born from a live leak: 58 orphaned broker + `codex app-server` process pairs
+and 3,164 leftover `codex-plugin-test-*` temp dirs had accumulated under
+`$TMPDIR`. The detached shared broker had no liveness tie to anything — only an
+explicit `broker/shutdown` (the SessionEnd hook) ever ended it, so every path
+that skipped the hook (the test suite, a crashed or killed session) leaked the
+pair and its mkdtemp session dir forever.
 
-## 1.0.0
-
-- Initial version of the Codex plugin for Claude Code
+- **Broker self-termination**: the broker now exits on its own when
+  - the pid passed via `--watch-pid` dies (polled; interval configurable with
+    `CODEX_COMPANION_BROKER_WATCH_INTERVAL_MS`),
+  - its `codex app-server` child exits — a dead child previously left a zombie
+    endpoint that `ensureBrokerSession` kept reusing, or
+  - no client has been connected for `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS`
+    (default 2 hours, `0` disables) — the crash-path backstop; the next
+    invocation lazily respawns a broker, so an idle reap costs one cold start.
+- **Session dir hygiene**: the broker receives its mkdtemp session dir via
+  `--session-dir` and removes it (socket, pid file, log) on every exit path;
+  `teardownBrokerSession` removes an explicitly recorded session dir
+  recursively instead of only when already empty.
+- **Test harness stops leaking**: `makeTempDir` removes everything it created
+  when the test process exits, and the fake-codex fixture points every
+  test-spawned broker's `--watch-pid` at the test process — brokers die with
+  the run instead of outliving it. New regression tests cover all three broker
+  exit paths.
+- Fix: the test suite could not even load since 1.2.0 — an unescaped backtick
+  in the fixture's embedded script broke the module parse, and the sandbox
+  enforcement check tripped on the plugin's legitimate `app-server --help`
+  availability probe. Both fixed; the full suite runs green again.
 
 ## 1.2.0 (2026-08-31) — review-only enforced structurally, everywhere
 
@@ -41,3 +52,23 @@ the app-server boundary.
   skipped. Background review work is never silent again.
 - Gate default remains OFF per repository; `/codex:setup --enable-review-gate`
   opts a repo in, and setup output names the repo scope it changed.
+
+## 1.1.0 (fork)
+
+- **Automatic account switching** (off by default): when `autoAccountSwitch` is
+  enabled and the active ChatGPT account crosses the usage threshold (or a run
+  fails with a usage-limit error), the plugin switches to the least-used account
+  stored by `codex-auth`, restarts the shared Codex runtime on its existing
+  endpoint, and retries once. New setup flags: `--enable-auto-account-switch`,
+  `--disable-auto-account-switch`, `--auto-switch-threshold <percent>`. Requires
+  `npm install -g @loongphy/codex-auth` and accounts registered by the user via
+  `codex-auth login` / `codex-auth import`.
+- **Review-only policy**: the sandbox is forced read-only at the plugin's single
+  write surface — Codex reviews, diagnoses, and proposes patches; the host
+  session applies edits itself. The rescue agent never passes `--write`.
+- Fix: `restartBrokerSession` recreates the endpoint directory before respawn
+  (teardown removes it once emptied) and never leaks a half-spawned broker.
+
+## 1.0.0
+
+- Initial version of the Codex plugin for Claude Code

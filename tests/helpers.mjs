@@ -4,8 +4,25 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+const createdTempDirs = new Set();
+let tempDirCleanupRegistered = false;
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  createdTempDirs.add(dir);
+  if (!tempDirCleanupRegistered) {
+    tempDirCleanupRegistered = true;
+    process.once("exit", () => {
+      for (const tempDir of createdTempDirs) {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {
+          // Best-effort: a still-running detached child may hold files open.
+        }
+      }
+    });
+  }
+  return dir;
 }
 
 export function writeExecutable(filePath, source) {

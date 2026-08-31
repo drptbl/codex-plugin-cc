@@ -11,10 +11,42 @@ import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+export const WATCH_PID_ENV = "CODEX_COMPANION_BROKER_WATCH_PID";
+export const WATCH_INTERVAL_ENV = "CODEX_COMPANION_BROKER_WATCH_INTERVAL_MS";
+export const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const BROKER_STATE_FILE = "broker.json";
 
-export function createBrokerSessionDir(prefix = "cxc-") {
+const BROKER_SESSION_DIR_PREFIX = "cxc-";
+
+export function parsePositiveInteger(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function resolveWatchPid(env) {
+  return parsePositiveInteger(env?.[WATCH_PID_ENV]);
+}
+
+export function createBrokerSessionDir(prefix = BROKER_SESSION_DIR_PREFIX) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// A session dir is only trusted for recursive removal when it is really one of
+// our mkdtemp dirs: directly under the OS temp root with the broker prefix.
+// The value can arrive from persisted broker.json state, which on a shared
+// tmp-backed state root must not be able to steer a recursive delete anywhere
+// else.
+export function isBrokerOwnedSessionDir(sessionDir) {
+  if (!sessionDir) {
+    return false;
+  }
+  try {
+    const resolved = fs.realpathSync(sessionDir);
+    const tmpRoot = fs.realpathSync(os.tmpdir());
+    return path.dirname(resolved) === tmpRoot && path.basename(resolved).startsWith(BROKER_SESSION_DIR_PREFIX);
+  } catch {
+    return false;
+  }
 }
 
 function connectToEndpoint(endpoint) {
@@ -57,9 +89,16 @@ export async function sendBrokerShutdown(endpoint) {
   });
 }
 
-export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
+export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, sessionDir = null, watchPid = null, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
+  const args = [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile];
+  if (sessionDir) {
+    args.push("--session-dir", sessionDir);
+  }
+  if (watchPid) {
+    args.push("--watch-pid", String(watchPid));
+  }
+  const child = spawn(process.execPath, args, {
     cwd,
     env,
     detached: true,
@@ -138,13 +177,16 @@ export async function ensureBrokerSession(cwd, options = {}) {
     options.scriptPath ??
     fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
 
+  const spawnEnv = options.env ?? process.env;
   const child = spawnBrokerProcess({
     scriptPath,
     cwd,
     endpoint,
     pidFile,
     logFile,
-    env: options.env ?? process.env
+    sessionDir,
+    watchPid: options.watchPid ?? resolveWatchPid(spawnEnv),
+    env: spawnEnv
   });
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
@@ -199,13 +241,28 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  const resolvedSessionDir = sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
-  if (resolvedSessionDir && fs.existsSync(resolvedSessionDir)) {
+  // Recursive removal is reserved for dirs proven to be broker-owned mkdtemp
+  // dirs; anything else (a dir derived from pidFile/logFile, or a persisted
+  // sessionDir that fails validation) is only removed once empty.
+  const resolvedSessionDir =
+    sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
+  if (!resolvedSessionDir || !fs.existsSync(resolvedSessionDir)) {
+    return;
+  }
+
+  if (sessionDir && isBrokerOwnedSessionDir(sessionDir)) {
     try {
-      fs.rmdirSync(resolvedSessionDir);
+      fs.rmSync(sessionDir, { recursive: true, force: true });
     } catch {
-      // Ignore non-empty or missing directories.
+      // Ignore races with a broker removing its own session dir.
     }
+    return;
+  }
+
+  try {
+    fs.rmdirSync(resolvedSessionDir);
+  } catch {
+    // Ignore non-empty or missing directories.
   }
 }
 
@@ -259,7 +316,16 @@ export async function restartBrokerSession(cwd, options = {}) {
   const scriptPath =
     options.scriptPath ?? fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
   const spawnProcess = options.spawnProcess ?? spawnBrokerProcess;
-  const child = spawnProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env });
+  const child = spawnProcess({
+    scriptPath,
+    cwd,
+    endpoint,
+    pidFile,
+    logFile,
+    sessionDir,
+    watchPid: options.watchPid ?? resolveWatchPid(env),
+    env
+  });
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 5000);
   if (!ready) {

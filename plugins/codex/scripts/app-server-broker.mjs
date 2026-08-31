@@ -8,8 +8,24 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { IDLE_TIMEOUT_ENV, WATCH_INTERVAL_ENV, parsePositiveInteger } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const DEFAULT_WATCH_INTERVAL_MS = 5000;
+// A live session tears the broker down via the SessionEnd hook; the idle
+// timeout only exists to reap brokers whose session died without it (crash,
+// SIGKILL, closed terminal). The next invocation lazily respawns one, so a
+// generous default costs at most one app-server cold start.
+const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -52,7 +68,7 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "session-dir", "watch-pid"]
   });
 
   if (!options.endpoint) {
@@ -63,6 +79,13 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const sessionDir = options["session-dir"] ? path.resolve(options["session-dir"]) : null;
+  const watchPid = parsePositiveInteger(options["watch-pid"]);
+  const watchIntervalMs = parsePositiveInteger(process.env[WATCH_INTERVAL_ENV]) ?? DEFAULT_WATCH_INTERVAL_MS;
+  const idleTimeoutMs =
+    process.env[IDLE_TIMEOUT_ENV] !== undefined
+      ? (parsePositiveInteger(process.env[IDLE_TIMEOUT_ENV]) ?? 0)
+      : DEFAULT_IDLE_TIMEOUT_MS;
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -99,7 +122,10 @@ async function main() {
     }
   }
 
+  let shuttingDown = false;
+
   async function shutdown(server) {
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -111,16 +137,34 @@ async function main() {
     if (pidFile && fs.existsSync(pidFile)) {
       fs.unlinkSync(pidFile);
     }
+    // The broker owns its mkdtemp session dir (socket, pid file, log file).
+    // Nobody else cleans it on self-initiated exits, so remove it here; the
+    // SessionEnd teardown path tolerates it already being gone.
+    if (sessionDir && fs.existsSync(sessionDir)) {
+      try {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      } catch {
+        // Best-effort: an open log fd on Windows can block removal.
+      }
+    }
   }
 
   appClient.setNotificationHandler(routeNotification);
 
+  let lastActivityAt = Date.now();
+
+  function markActivity() {
+    lastActivityAt = Date.now();
+  }
+
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    markActivity();
     socket.setEncoding("utf8");
     let buffer = "";
 
     socket.on("data", async (chunk) => {
+      markActivity();
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
@@ -225,12 +269,48 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      markActivity();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      markActivity();
     });
+  });
+
+  async function exitWith(reason, code) {
+    if (shuttingDown) {
+      return;
+    }
+    process.stderr.write(`${reason}\n`);
+    await shutdown(server);
+    process.exit(code);
+  }
+
+  // Without a liveness tie the detached broker (and its codex app-server
+  // child) outlives every owner that forgets — or crashes before — the
+  // explicit broker/shutdown. Watch the owning pid when given one, and reap
+  // ourselves after a long stretch with no connected clients.
+  const watchdog = setInterval(() => {
+    if (shuttingDown) {
+      return;
+    }
+    if (watchPid && !isProcessAlive(watchPid)) {
+      void exitWith(`Watched pid ${watchPid} exited; shutting down broker.`, 0);
+      return;
+    }
+    if (idleTimeoutMs > 0 && sockets.size === 0 && !activeStreamSocket && Date.now() - lastActivityAt > idleTimeoutMs) {
+      void exitWith(`No client activity for ${idleTimeoutMs}ms; shutting down idle broker.`, 0);
+    }
+  }, watchIntervalMs);
+  watchdog.unref();
+
+  // A broker whose codex app-server died can only answer with errors, yet its
+  // live endpoint makes ensureBrokerSession keep reusing it. Exit instead so
+  // the next invocation respawns a healthy pair.
+  appClient.exitPromise.then(() => {
+    void exitWith("codex app-server exited; shutting down broker.", 1);
   });
 
   process.on("SIGTERM", async () => {
