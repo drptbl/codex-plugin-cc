@@ -488,7 +488,11 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    // LOCAL POLICY (2026-08-31, operator decision): Codex is REVIEW-ONLY on this
+    // machine — it reports findings; the host session (Fable) triages and makes
+    // every edit itself. The sandbox is forced read-only regardless of --write;
+    // this line was the plugin's single write surface.
+    sandbox: "read-only",
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
